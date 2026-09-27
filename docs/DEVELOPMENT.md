@@ -236,12 +236,28 @@ an existing entry while it remains present in persistent storage.
 An active escrow with no state-changing activity can eventually reach expiry.
 Once the persistent escrow entry has expired, `touch_ttl` cannot recover it:
 the current implementation calls `load_escrow` before attempting the TTL
-extension, and a missing entry is reported as `NotFound`. The expired record
-is therefore inaccessible through the current contract interface. Expiration
-of the record does not remove the token balance; the funds remain in the token
-contract at the escrow contract's address. Long-lived active escrows therefore
-require a keeper to call `touch_ttl` before expiry. Anyone may perform this
-keeper action because `touch_ttl` is permissionless.
+extension, and a missing entry is reported as `NotFound` (the id never
+existed, or its persistent entry was archived). `ttl_info(escrow_id)` is a
+read-only keeper view of the remaining ledgers; poll it and call
+`touch_ttl` while the escrow is still present and its TTL approaches the
+29-day bump threshold. SDK 27 does not expose host TTL introspection to
+contracts, so the contract mirrors each escrow expiration ledger in a
+companion persistent key and updates it alongside the escrow's 30-day TTL
+bumps. The test-only `get_ttl` host helper checks this mirror in tests.
+
+If `ttl_info` or `touch_ttl` returns `NotFound`, determine whether the id
+never existed or its escrow entry was archived. A keeper cannot restore an
+archived entry through a contract call. Prepare a transaction whose Soroban
+footprint includes the escrow data key in `readWrite`, simulate it to populate
+resource and fee data, and submit a standalone `RestoreFootprintOp`; after
+restoration confirms, invoke the contract again to read the record and
+continue the recovery flow. On Protocol 23 and later, a simulated invocation
+may include archived entries in its restore list and restore them
+automatically; the standalone operation is useful when restoration fees
+should be paid separately. Restoring the record does not move escrow funds:
+they remain at the escrow contract's address in the token contract, and any
+payout still requires a successful contract invocation against restored
+state. Keeper calls are permissionless.
 
 ### Subscription records
 

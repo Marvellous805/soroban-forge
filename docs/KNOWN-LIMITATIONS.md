@@ -54,6 +54,14 @@ persistent storage with `touch_ttl`; their small counter and enumeration
 indexes remain in instance storage. Escrow, multi-sig wallet, DAO governance,
 and marketplace royalties also use persistent records with keeper entrypoints.
 
+An escrow whose persistent entry expires becomes inaccessible to contract
+calls until the entry is restored. Keepers can monitor its remaining TTL with
+`ttl_info` and call `touch_ttl` before expiry; `NotFound` from either means
+the id never existed or the entry is already archived. Archived entries need
+a transaction-level `RestoreFootprintOp` (or protocol auto-restoration from a
+simulated invocation) before contract access can resume. The token balance
+remains held by the escrow contract while the record is archived.
+
 ### 3. No events in other contracts
 
 Vesting, escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed lifecycle events. Other contracts remain to be assessed for event coverage.
