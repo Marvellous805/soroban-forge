@@ -104,6 +104,7 @@ to the proposer or forfeited to the treasury at a terminal transition.
 | `charge_catchup`   | ✅ Implemented     | Atomically settles up to 32 elapsed periods per call; refuses `PastDue` |
 | `cancel`           | ✅ Implemented     | Subscriber or owner                                                     |
 | `get_subscription` | ✅ Implemented     | Read-only                                                               |
+| Storage / `touch_ttl` | ✅ Implemented | Subscription records use persistent storage with 30-day TTL bumps; counter and indexes stay in instance storage |
 | Plan management    | ❌ Not implemented | Follow-up                                                               |
 
 ## Marketplace Royalties (`crates/marketplace-royalties`)

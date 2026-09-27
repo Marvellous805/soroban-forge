@@ -19,7 +19,7 @@ contract** and remain open for the other four:
    partial state. Marketplace royalties, vesting, and DAO governance
    (proposal bonds) have since gained settlement the same way;
    subscriptions still move nothing.
-2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, and marketplace royalties now use **persistent** entries with TTL bumps on every write and permissionless `touch_ttl` keeper entrypoints. Vesting and subscriptions still use instance storage.
+2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, marketplace royalties, and subscription records use **persistent** entries with TTL bumps and permissionless `touch_ttl` keeper entrypoints. Vesting records remain in instance storage; subscription counters and enumeration indexes remain instance-scoped.
 3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, marketplace royalties, and vesting emit lifecycle events.
 4. **Arbiter stored but unreachable** — `dispute` (claimant-authorized)
    and `resolve` (arbiter-only, final) make the third party live.
@@ -46,11 +46,13 @@ transition.) The remaining contract gets its own tranche using the escrow
 pattern (see
 [RESUBMISSION.md](RESUBMISSION.md#phase-1--flagship-escrow-primitive-3-weeks)).
 
-### 2. Instance-only storage outside escrow, multi-sig wallet, DAO governance, and marketplace royalties
+### 2. Instance-only storage outside escrow, multi-sig wallet, DAO governance, marketplace royalties, and subscriptions
 
-Vesting and subscriptions keep state in `env.storage().instance()`.
-Long-lived records there still face the byte budget and TTL-expiry
-bricking problem. (Escrow, multi-sig wallet, DAO governance, and marketplace royalties migrated per-record data to persistent storage with `touch_ttl` keeper entrypoints).
+Vesting schedule records remain in `env.storage().instance()` and face the
+byte-budget and TTL-expiry bricking problem. Subscription records moved to
+persistent storage with `touch_ttl`; their small counter and enumeration
+indexes remain in instance storage. Escrow, multi-sig wallet, DAO governance,
+and marketplace royalties also use persistent records with keeper entrypoints.
 
 ### 3. No events in other contracts
 

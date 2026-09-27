@@ -112,6 +112,12 @@ pub trait SorobanForgeSubscriptionPayments {
         subscription_id: u64,
     ) -> Result<Subscription, soroban_forge_shared_utils::ForgeError>;
 
+    /// Permissionlessly extend the persistent subscription record's TTL.
+    fn touch_ttl(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
     /// Total number of subscriptions created so far (read-only view).
     fn get_subscription_count(env: Env) -> u64;
 
@@ -142,6 +148,12 @@ pub trait SorobanForgeSubscriptionPayments {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Subscription>, soroban_forge_shared_utils::ForgeError>;
+}
+
+mod ttl {
+    pub const DAY_IN_LEDGERS: u32 = 17_280;
+    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
 }
 
 /// Lifecycle state of a subscription.
@@ -238,9 +250,7 @@ impl SubscriptionPayments {
             paused_at: None,
             failed_attempts: 0,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         // Index writes join the success path after every fallible step
         // (validation, `require_auth`, id allocation), so they cannot
         // observe or create partial state.
@@ -299,9 +309,7 @@ impl SubscriptionPayments {
                 subscription.failed_attempts = 0;
                 subscription.status = SubscriptionStatus::Active;
                 subscription.paused_at = None;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &subscription);
+                Self::store_subscription(&env, subscription_id, &subscription);
                 events::charged(&env, &subscription);
                 Ok(subscription.amount)
             }
@@ -313,9 +321,7 @@ impl SubscriptionPayments {
                 } else {
                     subscription.status = SubscriptionStatus::PastDue;
                 }
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &subscription);
+                Self::store_subscription(&env, subscription_id, &subscription);
                 Ok(0)
             }
         }
@@ -372,9 +378,7 @@ impl SubscriptionPayments {
             subscription.failed_attempts = 0;
             subscription.status = SubscriptionStatus::Active;
             subscription.paused_at = None;
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &subscription);
+            Self::store_subscription(&env, subscription_id, &subscription);
         }
         Ok(total)
     }
@@ -391,9 +395,7 @@ impl SubscriptionPayments {
 
         subscription.status = SubscriptionStatus::Paused;
         subscription.paused_at = Some(env.ledger().timestamp());
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         Ok(())
     }
 
@@ -420,9 +422,7 @@ impl SubscriptionPayments {
             .ok_or(ForgeError::ArithmeticOverflow)?;
         subscription.status = SubscriptionStatus::Active;
         subscription.paused_at = None;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         Ok(())
     }
 
@@ -439,9 +439,7 @@ impl SubscriptionPayments {
 
         subscription.status = SubscriptionStatus::Cancelled;
         subscription.paused_at = None;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         events::cancelled(&env, &subscription);
         Ok(())
     }
@@ -449,6 +447,16 @@ impl SubscriptionPayments {
     /// Read a stored subscription by id (read-only view).
     pub fn get_subscription(env: Env, subscription_id: u64) -> Result<Subscription, ForgeError> {
         Self::get_subscription_impl(&env, subscription_id)
+    }
+
+    /// Extend a present subscription entry's TTL. Permissionless for keepers.
+    pub fn touch_ttl(env: Env, subscription_id: u64) -> Result<(), ForgeError> {
+        let key = DataKey::Subscription(subscription_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(ForgeError::NotFound);
+        }
+        Self::bump_subscription(&env, &key);
+        Ok(())
     }
 
     /// Total number of subscriptions created so far (read-only view).
@@ -518,9 +526,21 @@ impl SubscriptionPayments {
 
     fn get_subscription_impl(env: &Env, subscription_id: u64) -> Result<Subscription, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Subscription(subscription_id))
             .ok_or(ForgeError::NotFound)
+    }
+
+    fn store_subscription(env: &Env, subscription_id: u64, subscription: &Subscription) {
+        let key = DataKey::Subscription(subscription_id);
+        env.storage().persistent().set(&key, subscription);
+        Self::bump_subscription(env, &key);
+    }
+
+    fn bump_subscription(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
     }
 
     /// Append `subscription_id` to an index, carrying the address the index
@@ -639,6 +659,7 @@ mod props;
 mod tests {
     use super::*;
     use soroban_forge_test_utils::TestAccounts;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::{Address, Env};
@@ -1349,5 +1370,42 @@ mod tests {
 
         let events = env.events().all();
         assert!(!events.events().is_empty());
+    }
+
+    #[test]
+    fn persistent_record_and_touch_ttl_are_available() {
+        let (env, _token, _tc, contract_id, client, _accounts, subscription_id) = setup!();
+        let key = DataKey::Subscription(subscription_id);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        assert_eq!(
+            client.get_subscription(&subscription_id).subscription_id,
+            subscription_id
+        );
+        env.ledger().set_timestamp(START + PERIOD);
+        assert_eq!(client.charge(&subscription_id), AMOUNT);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        client.cancel(&subscription_id);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        env.ledger().set_sequence_number(ttl::BUMP_THRESHOLD + 100);
+        assert_eq!(client.touch_ttl(&subscription_id), ());
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+
+        let err = client.try_touch_ttl(&u64::MAX).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
     }
 }

@@ -243,6 +243,18 @@ contract at the escrow contract's address. Long-lived active escrows therefore
 require a keeper to call `touch_ttl` before expiry. Anyone may perform this
 keeper action because `touch_ttl` is permissionless.
 
+### Subscription records
+
+`subscription-payments` stores each `DataKey::Subscription(id)` record in
+persistent storage and extends it to 30 days whenever subscribe, charge,
+charge catch-up, pause, resume, or cancel writes the record. The threshold is
+29 days, following the same extend-to pattern as escrow. The `Count` counter
+and the subscriber/provider enumeration indexes remain in instance storage.
+Any account may call `touch_ttl(subscription_id)` to extend a present record;
+it returns `NotFound` when the id is absent. Keepers should touch long-lived
+subscriptions before their TTL approaches expiry. This storage cutover
+assumes no deployed mainnet instance contains live subscription records.
+
 ### Token trust model
 
 `create_escrow` accepts a user-specified token address. The escrow does not
