@@ -20,7 +20,7 @@ contract** and remain open for the other four:
    (proposal bonds) have since gained settlement the same way;
    subscriptions still move nothing.
 2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, and marketplace royalties now use **persistent** entries with TTL bumps on every write and permissionless `touch_ttl` keeper entrypoints. Vesting and subscriptions still use instance storage.
-3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit lifecycle events; only vesting remains silent.
+3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, marketplace royalties, and vesting emit lifecycle events.
 4. **Arbiter stored but unreachable** — `dispute` (claimant-authorized)
    and `resolve` (arbiter-only, final) make the third party live.
    `Disputed` is a real state, verified by tests.
@@ -52,9 +52,9 @@ Vesting and subscriptions keep state in `env.storage().instance()`.
 Long-lived records there still face the byte budget and TTL-expiry
 bricking problem. (Escrow, multi-sig wallet, DAO governance, and marketplace royalties migrated per-record data to persistent storage with `touch_ttl` keeper entrypoints).
 
-### 3. No events in vesting contract
+### 3. No events in other contracts
 
-Vesting remains without an event module. Escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed on-chain events.
+Vesting, escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed lifecycle events. Other contracts remain to be assessed for event coverage.
 
 
 ### 4. Negative authorization coverage outside escrow, vesting, and DAO governance

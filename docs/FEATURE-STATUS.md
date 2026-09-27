@@ -56,6 +56,7 @@ to the proposer or forfeited to the treasury at a terminal transition.
 | `get_status`                  | ✅ Implemented     | Read-only                                                                                                                                                                                                                            |
 | Revocation                    | ❌ Not implemented | `Revoked` status reserved                                                                                                                                                                                                            |
 | `VestingSchedule.token` field | ✅ Wired           | Read by `claim` for the SEP-41 payout                                                                                                                                                                                                |
+| Events                        | ✅ Implemented     | `ScheduleCreated` and `Claimed` (`schedule_id` as topic); zero claims are silent                                                                                                                                                      |
 
 ## Multi-Sig Wallet (`crates/multi-sig-wallet`)
 

@@ -1,6 +1,6 @@
 use super::*;
 use soroban_forge_test_utils::TestAccounts;
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::Env;
 
@@ -51,6 +51,23 @@ fn create_schedule_succeeds_and_is_locked() {
     let id = create(&client, &token, &accounts);
     assert_eq!(client.get_status(&id), VestingStatus::Locked);
     assert_eq!(client.claimable(&id), 0);
+}
+
+#[test]
+fn lifecycle_events_cover_creation_claim_and_silent_zero_claim() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    let before_create = env.events().all().len();
+    let id = create(&client, &token, &accounts);
+    assert_eq!(env.events().all().len(), before_create + 1);
+
+    let after_create = env.events().all().len();
+    assert_eq!(client.claim(&id), 0);
+    assert_eq!(env.events().all().len(), after_create);
+
+    env.ledger().set_timestamp(START + DURATION);
+    let before_claim = env.events().all().len();
+    assert_eq!(client.claim(&id), TOTAL);
+    assert!(env.events().all().len() > before_claim);
 }
 
 #[test]
