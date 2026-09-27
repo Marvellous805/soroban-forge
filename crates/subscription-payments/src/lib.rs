@@ -372,6 +372,7 @@ impl SubscriptionPayments {
                 .checked_add(subscription.amount)
                 .ok_or(ForgeError::ArithmeticOverflow)?;
             subscription.last_charged = next_due;
+            events::charged(&env, &subscription);
         }
 
         if periods > 0 {
@@ -1360,7 +1361,6 @@ mod tests {
         let err = client.try_cancel(&subscription_id).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::InvalidInput);
     }
-
     #[test]
     fn events_emitted_on_lifecycle_actions() {
         let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
@@ -1368,8 +1368,67 @@ mod tests {
         client.charge(&subscription_id);
         client.cancel(&subscription_id);
 
+        let all_events = env.events().all();
+        assert!(!all_events.events().is_empty());
+    }
+
+    #[test]
+    fn charge_catchup_emits_charged_event_per_settled_period() {
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
+        env.ledger().set_timestamp(START + PERIOD * 3);
+
+        let total = client.charge_catchup(&subscription_id, &3);
+        assert_eq!(total, AMOUNT * 3);
+
         let events = env.events().all();
-        assert!(!events.events().is_empty());
+        assert!(
+            !events.events().is_empty(),
+            "Events should be emitted during catchup"
+        );
+    }
+
+    #[test]
+    fn charge_catchup_periods_zero_emits_no_events() {
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
+
+        let total = client.charge_catchup(&subscription_id, &0);
+        assert_eq!(total, 0);
+
+        let events = env.events().all();
+        assert!(
+            events.events().is_empty(),
+            "No new events should be emitted when charging 0 periods"
+        );
+    }
+
+    #[test]
+    fn charge_catchup_failed_transfer_rolls_back_events() {
+        let (env, token, _tc, _contract_id, client, accounts, _id) = setup!();
+        let broke_user = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&broke_user, &AMOUNT);
+
+        let sub_id = client.subscribe(&broke_user, &accounts.validator, &token, &AMOUNT, &PERIOD);
+        env.ledger().set_timestamp(START + PERIOD * 3);
+
+        let res = client.try_charge_catchup(&sub_id, &3);
+        assert!(res.is_err());
+
+        let events = env.events().all();
+        assert!(
+            events.events().is_empty(),
+            "Failed transfer should roll back emitted events"
+        );
+    }
+
+    #[test]
+    fn charge_catchup_advances_last_charged_and_event_payloads() {
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
+        env.ledger().set_timestamp(START + PERIOD * 2);
+
+        client.charge_catchup(&subscription_id, &2);
+
+        let sub = client.get_subscription(&subscription_id);
+        assert_eq!(sub.last_charged, START + PERIOD * 2);
     }
 
     #[test]

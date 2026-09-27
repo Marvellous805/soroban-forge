@@ -1,15 +1,17 @@
 # Soroban Forge — Contract Template
 
-Use this template to bootstrap a new Soroban Forge contract crate.
+Use the CLI to scaffold a new Soroban Forge contract crate:
 
 ```bash
-cp -r templates/contract crates/my-contract
+cargo run -p soroban-forge-cli -- new my-contract
 ```
 
-Then:
+The generator writes a minimal, standalone contract crate with:
 
-1. Update `Cargo.toml` name and description.
-2. Replace contract type, state, and methods in `src/lib.rs`.
-3. Add tests in `src/tests.rs`.
-4. Register the new crate in the workspace `Cargo.toml`.
-5. Add documentation under `docs/contracts/`.
+1. a `Cargo.toml` ready for `cargo check`
+2. a `src/lib.rs` re-exporting the generated contract
+3. a `src/contract.rs` implementing an example method
+4. `src/errors.rs` containing a valid `ForgeError`
+5. `src/types.rs` for domain-specific types
+
+From there, customize the generated contract code and add tests as needed.

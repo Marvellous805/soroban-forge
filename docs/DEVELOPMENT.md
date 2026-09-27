@@ -19,10 +19,8 @@ cargo run -p soroban-forge-cli -- new my-token
 cargo run -p soroban-forge-cli -- new my-token --path ./custom/path/my-token
 ```
 
-
-### Rust and Toolchain
-
-The project requires **stable Rust** and the `wasm32v1-none` target for Soroban contracts.
+The generated crate is a standalone project that compiles with `cargo check`
+without depending on the workspace layout or a stale shared-utils version pin.
 
 ```bash
 # Install or update Rust

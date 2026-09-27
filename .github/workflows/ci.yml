@@ -124,6 +124,18 @@ jobs:
             exit 1
           fi
 
+  scaffold:
+    name: Scaffold Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify the generated scaffold builds outside the repo
+        run: |
+          tmpdir=$(mktemp -d)
+          cargo run -p soroban-forge-cli -- new scaffold-check --path "$tmpdir/scaffold-check"
+          cargo check --manifest-path "$tmpdir/scaffold-check/Cargo.toml"
+
   typescript-sdk:
     name: TypeScript SDK
     runs-on: ubuntu-latest

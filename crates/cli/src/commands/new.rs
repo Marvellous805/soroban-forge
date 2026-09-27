@@ -147,6 +147,34 @@ mod tests {
 
         let cargo_content = fs::read_to_string(target_path.join("Cargo.toml"))?;
         assert!(cargo_content.contains("name = \"soroban-forge-test-token\""));
+        assert!(!cargo_content.contains("version.workspace = true"));
+        assert!(!cargo_content.contains("0.1.0"));
+
+        let errors_content = fs::read_to_string(target_path.join("src/errors.rs"))?;
+        assert!(errors_content.contains("pub enum ForgeError"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_generated_scaffold_compiles() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let target_path = temp_dir.path().join("scaffold-check");
+
+        let args = NewArgs {
+            name: "scaffold-check".to_string(),
+            path: Some(target_path.clone()),
+        };
+
+        run(args)?;
+
+        let status = std::process::Command::new("cargo")
+            .args(["check"])
+            .current_dir(&target_path)
+            .status()
+            .context("failed to run cargo check for generated scaffold")?;
+
+        assert!(status.success(), "generated scaffold failed cargo check");
 
         Ok(())
     }
