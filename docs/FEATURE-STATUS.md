@@ -111,6 +111,7 @@ to the proposer or forfeited to the treasury at a terminal transition.
 | Entrypoint               | Status             | Notes                                                                                                                 |
 | ------------------------ | ------------------ | --------------------------------------------------------------------------------------------------------------------- |
 | `set_royalty`            | ✅ Implemented     | Basis-point caps validated                                                                                            |
+| `disable_royalty` / `enable_royalty` | ✅ Implemented | Collection-authorized status transitions preserve stored bps and recipient |
 | `distribute`             | ⚠️ Computes only   | Pure split math; **pays no recipients** (use `settle_sale`)                                                           |
 | `settle_sale`            | ✅ Implemented     | **Real token transfers** payer → seller, then payer → royalty recipient; transfer-before-state, totals committed last |
 | `get_royalty`            | ✅ Implemented     | Read-only                                                                                                             |

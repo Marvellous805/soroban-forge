@@ -9,6 +9,8 @@ all-or-nothing batch).
 
 ```rust
 fn set_royalty(collection, recipient, bps) -> Result<(), ForgeError>
+fn disable_royalty(collection) -> Result<(), ForgeError>
+fn enable_royalty(collection) -> Result<(), ForgeError>
 fn distribute(collection, seller, amount) -> Result<i128, ForgeError>
 fn settle_sale(collection, token, payer, seller, amount) -> Result<Settlement, ForgeError>
 fn settle_sales(collection, token, payer, sales: Vec<(seller, amount)>) -> Result<Vec<Settlement>, ForgeError>
@@ -52,6 +54,13 @@ partially paid and never commits totals.
 
 `distribute` stays a pure computation for callers that only need the net; it
 moves no tokens.
+
+The collection can pause enforcement with `disable_royalty` and restore it
+with `enable_royalty`. Both require collection authorization, return
+`NotFound` when no configuration exists, and reject a repeated transition
+with `InvalidInput`. Disabling preserves the recipient and bps; `distribute`
+then returns the full amount as seller net, and settlement skips the
+recipient transfer. Re-enabling restores the exact prior split.
 
 ### Batch settlement
 
@@ -108,4 +117,3 @@ The contract emits typed on-chain lifecycle events for indexers and off-chain mo
 
 - `RoyaltyConfigured` (topic: `collection: Address`) — emitted when a royalty configuration is registered or updated via `set_royalty`. Contains `recipient` and `bps`.
 - `SaleSettled` (topic: `collection: Address`) — emitted on sale settlement via `settle_sale` or `settle_sales`. Contains `token`, `payer`, `seller`, `royalty_recipient`, `gross_amount`, `seller_net`, and `royalty_share`.
-
