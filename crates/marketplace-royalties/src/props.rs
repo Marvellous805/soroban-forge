@@ -16,15 +16,14 @@
 //!    raises for that defect and leaves every balance and the committed
 //!    summary byte-identical to the pre-call state.
 
-use crate::{
-    MarketplaceRoyalties, SettlementSummary, SorobanForgeMarketplaceRoyaltiesClient,
-    MAX_SETTLE_SALES,
-};
 //! 4. Batch conservation: the aggregate of a random batch satisfies `sum(seller_net) + sum(royalty_share) == sum(amount)`.
 //! 5. Cap boundary: a batch exceeding `MAX_SETTLE_SALES` is rejected before any transfer.
 //! 6. Rollback integrity: a failed batch transfer leaves every balance and the summary untouched.
 
-use crate::{MarketplaceRoyalties, SorobanForgeMarketplaceRoyaltiesClient, MAX_SETTLE_SALES};
+use crate::{
+    MarketplaceRoyalties, SettlementSummary, SorobanForgeMarketplaceRoyaltiesClient,
+    MAX_SETTLE_SALES,
+};
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;
 use soroban_forge_shared_utils::ForgeError;
