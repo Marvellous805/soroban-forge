@@ -2,7 +2,7 @@
 //!
 //! The hand-written suite pins behaviour on known values; this module tries
 //! to *falsify* the contract's fund-safety claims over generated inputs.
-//! Four properties are exercised:
+//! Five properties are exercised:
 //!
 //! **P1 — Conservation.** On every terminal path, for random amounts,
 //! timeouts, dispute claimants and resolution directions: the contract ends
@@ -24,6 +24,11 @@
 //! total, and terminal escrows are never payable twice. The mirror state
 //! machine now tracks `released` alongside the lifecycle state.
 //!
+//! **P4 — Participant index consistency.** Random create/cancel interleavings
+//! across two buyers and two sellers keep each live participant index equal
+//! to the set of addressable, non-cancelled escrows. A cancelled escrow is
+//! never returned, and every returned id still resolves.
+//!
 //! All properties run against a real Stellar Asset Contract, so balances
 //! reflect actual token movement. Runs are deterministic (fixed default
 //! seed); a failure prints its case seed for replay. Override the case count
@@ -34,7 +39,7 @@ use proptest::prelude::*;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Vec};
 
 const START: u64 = 1_000_000;
 const MAX_AMOUNT: i128 = 1_000_000_000_000;
@@ -74,6 +79,38 @@ fn setup_world() -> World {
         arbiter: Address::generate(&env),
         outsider,
         env,
+    }
+}
+
+fn assert_participant_indexes_consistent(w: &World, ids: &Vec<u64>, parties: &[Address]) {
+    let client = w.escrow_client();
+    for party in parties {
+        let mut expected = Vec::new(&w.env);
+        for index in 0..ids.len() {
+            let id = ids.get_unchecked(index);
+            let record: EscrowData = client.get_escrow(&id);
+            let involved =
+                record.buyer == *party || record.seller == *party || record.arbiter == *party;
+            if involved && record.status != EscrowStatus::Cancelled {
+                expected.push_back(id);
+            }
+        }
+
+        let page = client.escrows_for_participant(party, &0, &u32::MAX);
+        assert_eq!(page.ids, expected, "index contents must match live escrows");
+        assert_eq!(page.total, expected.len());
+        for index in 0..page.ids.len() {
+            let id = page.ids.get_unchecked(index);
+            let record: EscrowData = client.get_escrow(&id);
+            assert_ne!(record.status, EscrowStatus::Cancelled);
+            for earlier in 0..index {
+                assert_ne!(
+                    page.ids.get_unchecked(earlier),
+                    id,
+                    "participant index must not contain duplicate ids"
+                );
+            }
+        }
     }
 }
 
@@ -586,5 +623,95 @@ proptest! {
                 "terminal escrow released must equal deposited amount");
         }
         let _ = Cancelled; // Cancelled is unreachable here (no cancel op in P3's set)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn p4_participant_indexes_match_live_escrows_after_create_cancel_interleavings(
+        actions in prop::collection::vec((0u8..=1, 0u8..=3), 1..=12),
+    ) {
+        let w = setup_world();
+        let buyer_a = Address::generate(&w.env);
+        let buyer_b = Address::generate(&w.env);
+        let seller_a = Address::generate(&w.env);
+        let seller_b = Address::generate(&w.env);
+        let parties = [
+            buyer_a.clone(),
+            buyer_b.clone(),
+            seller_a.clone(),
+            seller_b.clone(),
+            w.arbiter.clone(),
+        ];
+        let mut ids = Vec::new(&w.env);
+
+        for (operation, choice) in actions {
+            let mut pending_count = 0_u32;
+            for index in 0..ids.len() {
+                let id = ids.get_unchecked(index);
+                if w.escrow_client().get_status(&id) == EscrowStatus::Pending {
+                    pending_count += 1;
+                }
+            }
+
+            if operation == 0 || pending_count == 0 {
+                let buyer = if choice & 1 == 0 { &buyer_a } else { &buyer_b };
+                let seller = if choice & 2 == 0 { &seller_a } else { &seller_b };
+                let id = w.escrow_client().create_escrow(
+                    buyer,
+                    seller,
+                    &w.arbiter,
+                    &w.token,
+                    &1_i128,
+                    &1_u64,
+                );
+                ids.push_back(id);
+            } else {
+                let watched_party = &parties[usize::from(choice) % parties.len()];
+                let before_page = w
+                    .escrow_client()
+                    .escrows_for_participant(watched_party, &0, &u32::MAX);
+                let cursor = if before_page.total == 0 {
+                    0
+                } else {
+                    u32::from(choice) % before_page.total
+                };
+                let target = u32::from(choice) % pending_count;
+                let mut pending_at = 0_u32;
+                for index in 0..ids.len() {
+                    let id = ids.get_unchecked(index);
+                    if w.escrow_client().get_status(&id) == EscrowStatus::Pending {
+                        if pending_at == target {
+                            w.escrow_client().cancel(&id);
+                            break;
+                        }
+                        pending_at += 1;
+                    }
+                }
+
+                // Cursors are live offsets. After the cancellation, a page
+                // at this cursor must match the current full list at that
+                // same offset, even if earlier ids shifted left.
+                let current = w
+                    .escrow_client()
+                    .escrows_for_participant(watched_party, &0, &u32::MAX);
+                let continued = w
+                    .escrow_client()
+                    .escrows_for_participant(watched_party, &cursor, &1);
+                if cursor < current.ids.len() {
+                    prop_assert_eq!(continued.ids.len(), 1);
+                    prop_assert_eq!(
+                        continued.ids.get_unchecked(0),
+                        current.ids.get_unchecked(cursor),
+                    );
+                } else {
+                    prop_assert_eq!(continued.ids.len(), 0);
+                }
+            }
+
+            assert_participant_indexes_consistent(&w, &ids, &parties);
+        }
     }
 }

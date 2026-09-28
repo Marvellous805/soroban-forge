@@ -194,6 +194,15 @@
 //! usage describes the token's withdrawal history, not the policy, and a
 //! later limit is then measured against the withdrawals already in its
 //! window — the conservative direction.
+//!
+//! The read-only views `get_withdrawal_limit`, `get_withdrawal_window`, and
+//! `check_withdrawal` expose the current policy, active usage and projected
+//! expiry, and a simulation of the submission policy plus current funding.
+//! Missing policy/window data (including for an uninitialized wallet or an
+//! unknown token) is represented as `None` or an empty window; the check
+//! reports `WalletNotInitialized` for an uninitialized wallet. These views
+//! do not prune entries or write storage. The limit is enforced at withdrawal
+//! submission as an admission gate, not rechecked when the pending tx executes.
 
 //!
 //! ## Ordering discipline (load-bearing)
@@ -461,6 +470,22 @@ pub trait SorobanForgeMultiSigWallet {
     /// unconstrained.
     fn get_withdrawal_limit(env: Env, token: Address) -> Option<WithdrawalLimit>;
 
+    /// Read the active rolling window for `token` (read-only view).
+    ///
+    /// The start is the oldest active withdrawal's submission time, and
+    /// `reset_at` is that entry's projected expiry. A missing limit, empty
+    /// window, unknown token, or uninitialized wallet reads as an empty
+    /// window with zero total and absent timestamps. This view does not
+    /// prune or otherwise modify storage.
+    fn get_withdrawal_window(env: Env, token: Address) -> WindowState;
+
+    /// Simulate a withdrawal against the current policy and custody balance
+    /// without requiring authorization or modifying storage.
+    ///
+    /// The result reflects the state and ledger timestamp at this call; a
+    /// later submission or execution can differ if either changes.
+    fn check_withdrawal(env: Env, token: Address, amount: i128) -> CheckResult;
+
     /// Read how much of `token` is currently counted against its rolling
     /// window: the total of every withdrawal still inside the window,
     /// pending or executed (read-only view).
@@ -706,6 +731,51 @@ pub struct WithdrawalLimit {
     pub amount: i128,
     /// Length of the rolling window in seconds; positive.
     pub window_seconds: u64,
+}
+
+/// Read-only snapshot of a token's currently active withdrawal window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowState {
+    /// Total amount in active window entries, including pending withdrawals.
+    pub total: i128,
+    /// Submission time of the oldest active entry, if any.
+    pub window_start: Option<u64>,
+    /// Projected expiry of the oldest active entry, if any.
+    pub reset_at: Option<u64>,
+}
+
+/// Result of simulating a withdrawal against current wallet state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckResult {
+    /// The amount passes the current policy and funding checks.
+    Allowed,
+    /// The wallet has not been initialized.
+    WalletNotInitialized,
+    /// Withdrawal amounts must be positive.
+    InvalidAmount,
+    /// The rolling limit would be exceeded.
+    LimitExceeded,
+    /// The wallet's recorded custody balance is too small.
+    InsufficientFunds,
+    /// Adding the amount to current window usage would overflow `i128`.
+    ArithmeticOverflow,
+}
+
+enum WindowCheckError {
+    LimitExceeded,
+    ArithmeticOverflow,
+}
+
+fn check_window_total(usage: i128, amount: i128, limit: i128) -> Result<(), WindowCheckError> {
+    let total = usage
+        .checked_add(amount)
+        .ok_or(WindowCheckError::ArithmeticOverflow)?;
+    if total > limit {
+        return Err(WindowCheckError::LimitExceeded);
+    }
+    Ok(())
 }
 
 /// A threshold-gated change to a token's withdrawal limit, carried by
@@ -1222,6 +1292,60 @@ impl MultiSigWallet {
         Self::withdrawal_limit_impl(&env, &token)
     }
 
+    /// Read the active rolling window for `token` without pruning storage.
+    pub fn get_withdrawal_window(env: Env, token: Address) -> WindowState {
+        let Some(limit) = Self::withdrawal_limit_impl(&env, &token) else {
+            return WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            };
+        };
+        let now = env.ledger().timestamp();
+        let (entries, total) = Self::pruned_window(&env, &token, limit.window_seconds, now);
+        let mut oldest = None;
+        for i in 0..entries.len() {
+            let entry = entries.get_unchecked(i);
+            oldest = Some(oldest.map_or(entry.submitted_at, |current: u64| {
+                current.min(entry.submitted_at)
+            }));
+        }
+        let reset_at = oldest.map(|start| start.saturating_add(limit.window_seconds));
+        WindowState {
+            total,
+            window_start: oldest,
+            reset_at,
+        }
+    }
+
+    /// Simulate a withdrawal against the current policy and custody balance.
+    pub fn check_withdrawal(env: Env, token: Address, amount: i128) -> CheckResult {
+        if !Self::is_initialized(&env) {
+            return CheckResult::WalletNotInitialized;
+        }
+        if amount <= 0 {
+            return CheckResult::InvalidAmount;
+        }
+
+        if let Some(limit) = Self::withdrawal_limit_impl(&env, &token) {
+            let now = env.ledger().timestamp();
+            let (_entries, usage) = Self::pruned_window(&env, &token, limit.window_seconds, now);
+            let failure = match check_window_total(usage, amount, limit.amount) {
+                Ok(()) => None,
+                Err(WindowCheckError::LimitExceeded) => Some(CheckResult::LimitExceeded),
+                Err(WindowCheckError::ArithmeticOverflow) => Some(CheckResult::ArithmeticOverflow),
+            };
+            if let Some(failure) = failure {
+                return failure;
+            }
+        }
+
+        if Self::balance_impl(&env, &token) < amount {
+            return CheckResult::InsufficientFunds;
+        }
+        CheckResult::Allowed
+    }
+
     /// Read `token`'s current in-window withdrawal total (read-only view).
     ///
     /// Expired entries are excluded. Reads as `0` when no limit is
@@ -1538,13 +1662,14 @@ impl MultiSigWallet {
         let now = env.ledger().timestamp();
         let (mut entries, usage) = Self::pruned_window(env, token, limit.window_seconds, now);
 
-        // Checked *before* the comparison, so an overflowing total is
-        // reported rather than wrapping into a value that looks in-limit.
-        let total = usage
-            .checked_add(amount)
-            .ok_or(ForgeError::ArithmeticOverflow)?;
-        if total > limit.amount {
-            return Err(ForgeError::WithdrawalLimitExceeded);
+        match check_window_total(usage, amount, limit.amount) {
+            Ok(()) => {}
+            Err(WindowCheckError::LimitExceeded) => {
+                return Err(ForgeError::WithdrawalLimitExceeded);
+            }
+            Err(WindowCheckError::ArithmeticOverflow) => {
+                return Err(ForgeError::ArithmeticOverflow);
+            }
         }
 
         entries.push_back(WindowEntry {
@@ -3266,6 +3391,191 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_window_reports_oldest_active_expiry_and_empty_states() {
+        let (env, client, accounts, token, _token_client) = custody!();
+        client.deposit(&token, &accounts.user1, &2_000);
+        let unknown = Address::generate(&env);
+        assert_eq!(
+            client.get_withdrawal_window(&unknown),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+        assert_eq!(client.get_withdrawal_limit(&unknown), None);
+
+        env.ledger().set_timestamp(5_000);
+        limited!(client, accounts, token, 1_000_i128, 1_000_u64);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &300_i128);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 300,
+                window_start: Some(5_000),
+                reset_at: Some(6_000),
+            }
+        );
+
+        env.ledger().set_timestamp(5_999);
+        assert_eq!(client.get_withdrawal_window(&token).total, 300);
+        assert_eq!(
+            client.check_withdrawal(&token, &701),
+            CheckResult::LimitExceeded
+        );
+        env.ledger().set_timestamp(6_000);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+        assert_eq!(
+            client.check_withdrawal(&token, &1_000),
+            CheckResult::Allowed
+        );
+        env.ledger().set_timestamp(6_001);
+        assert_eq!(client.get_withdrawal_window(&token).total, 0);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &1_000);
+        assert_eq!(client.get_withdrawal_window(&token).total, 1_000);
+    }
+
+    #[test]
+    fn withdrawal_window_is_empty_when_uninitialized_or_limit_removed() {
+        let env = Env::default();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let token = Address::generate(&env);
+        assert_eq!(client.get_withdrawal_limit(&token), None);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+
+        let (_env, client, accounts, token, _token_client) = custody!();
+        limited!(client, accounts, token, 1_000_i128, 3_600_u64);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &600_i128);
+        let removal = client.remove_withdrawal_limit(&accounts.user1, &token);
+        client.confirm(&removal, &accounts.user2);
+        client.confirm(&removal, &accounts.user3);
+        client.execute(&removal);
+        assert_eq!(client.get_withdrawal_limit(&token), None);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn check_withdrawal_matches_submission_policy_without_mutating_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let accounts = TestAccounts::generate(&env);
+        let owners = owner_vec(&env, &accounts);
+        client.initialize(&owners, &2_u32);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let token_admin = StellarAssetClient::new(&env, &token);
+        token_admin.mint(&accounts.user1, &DEPOSIT);
+        client.deposit(&token, &accounts.user1, &DEPOSIT);
+        env.ledger().set_timestamp(7_000);
+        limited!(client, accounts, token, 1_000_i128, 3_600_u64);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &600_i128);
+
+        let before = env.as_contract(&contract_id, || {
+            (
+                env.storage()
+                    .persistent()
+                    .get::<_, Vec<WindowEntry>>(&DataKey::WindowUsage(token.clone())),
+                env.storage()
+                    .persistent()
+                    .get::<_, WithdrawalLimit>(&DataKey::WithdrawalLimit(token.clone())),
+                env.storage().instance().get::<_, u64>(&DataKey::Count),
+            )
+        });
+        assert_eq!(
+            client.get_withdrawal_limit(&token).unwrap(),
+            WithdrawalLimit {
+                token: token.clone(),
+                amount: 1_000,
+                window_seconds: 3_600,
+            }
+        );
+        assert_eq!(client.get_withdrawal_window(&token).total, 600);
+        assert_eq!(client.get_window_usage(&token), 600);
+        assert_eq!(client.check_withdrawal(&token, &400), CheckResult::Allowed);
+        assert_eq!(
+            client.check_withdrawal(&token, &401),
+            CheckResult::LimitExceeded
+        );
+        assert_eq!(
+            client.check_withdrawal(&token, &-1),
+            CheckResult::InvalidAmount
+        );
+        assert_eq!(
+            client.check_withdrawal(&Address::generate(&env), &1),
+            CheckResult::InsufficientFunds
+        );
+        let after = env.as_contract(&contract_id, || {
+            (
+                env.storage()
+                    .persistent()
+                    .get::<_, Vec<WindowEntry>>(&DataKey::WindowUsage(token.clone())),
+                env.storage()
+                    .persistent()
+                    .get::<_, WithdrawalLimit>(&DataKey::WithdrawalLimit(token.clone())),
+                env.storage().instance().get::<_, u64>(&DataKey::Count),
+            )
+        });
+        assert_eq!(before, after);
+
+        // Simulation predicts the next submission one second later:
+        // 600 + 400 fits, while 600 + 401 returns the enforcement error.
+        env.ledger().set_timestamp(7_001);
+        let admitted = client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &400);
+        assert_eq!(client.get_tx(&admitted).status, TxStatus::Pending);
+        let err = client
+            .try_submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &1_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::WithdrawalLimitExceeded);
+    }
+
+    #[test]
+    fn check_withdrawal_reports_uninitialized_wallet() {
+        let env = Env::default();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let token = Address::generate(&env);
+        assert_eq!(
+            client.check_withdrawal(&token, &1),
+            CheckResult::WalletNotInitialized
+        );
+    }
+
+    #[test]
     fn pending_and_executed_withdrawals_both_occupy_the_window() {
         let (env, client, accounts, token, _token_client) = custody!();
         client.deposit(&token, &accounts.user1, &10_000);
@@ -3327,6 +3637,10 @@ mod tests {
 
         client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &i128::MAX);
         assert_eq!(client.get_window_usage(&token), i128::MAX);
+        assert_eq!(
+            client.check_withdrawal(&token, &1),
+            CheckResult::ArithmeticOverflow
+        );
 
         // i128::MAX + 1 is not representable. The checked total surfaces it
         // instead of wrapping to i128::MIN, which would read as in-limit.
