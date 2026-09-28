@@ -75,10 +75,10 @@ well-documented foundation, audit it for your use case, and ship.
 > your own security review. The **escrow contract is the flagship**: it holds
 > and moves real SEP-41 tokens end-to-end and is verified by a conservation
 > property test. Marketplace royalties, multi-sig, and vesting have since
-> gained real settlement too, and DAO governance now settles a SEP-41
-> proposal bond (pulled at `propose`, refunded or forfeited at a terminal
-> transition); subscriptions remain a state machine awaiting the same
-> treatment — see the
+> gained real settlement too, DAO governance settles a SEP-41 proposal bond
+> (pulled at `propose`, refunded or forfeited at a terminal transition), and
+> subscriptions now bill each due period with a real subscriber → provider
+> transfer with past-due retry — see the
 > [Feature Status Matrix](docs/FEATURE-STATUS.md) and
 > [Known Limitations](docs/KNOWN-LIMITATIONS.md) for exactly what is and is
 > not done.
@@ -89,10 +89,16 @@ well-documented foundation, audit it for your use case, and ship.
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
 | **Escrow**                | Three-party escrow holding real SEP-41 tokens: `create → deposit → release_partial (×n) / release / refund / dispute → resolve / cancel`, arbiter-enforced dispute flow, partial-release accounting (`released`/`remaining`), lifecycle events, per-record persistent storage with TTL keeping | ✅ **Flagship** · 80 tests · conservation property verified |
 | **Vesting**               | Time-locked token release with cliff and linear release (`create_schedule → claim / claimable`) — `claim` settles through a real SEP-41 transfer                                                                   | ✅ Settlement · 27 tests                                    |
-| **Multi-Sig Wallet**      | Multi-owner wallet with configurable approval thresholds (`initialize → submit → confirm → execute`) — no dispatch yet                                                                                             | ✅ State machine · 18 tests                                 |
+| **Multi-Sig Wallet**      | Multi-owner wallet with configurable approval thresholds + rejection (`initialize → submit/confirm/reject → execute`) — threshold-gated cross-contract invocations and token withdrawals; transactions in persistent storage with TTL keeper | ✅ State machine · 109 tests |
 | **DAO Governance**        | On-chain proposals, one-vote-per-voter voting, deadline enforcement, and finalisation — SEP-41 proposal bonds pulled at `propose` and refunded/forfeited on settlement; dispatches approved actions on-chain | ✅ **Bond settlement** · 60 tests                          |
 | **Subscription Payments** | Recurring payment plans with periodic billing (`subscribe → charge / cancel`) — charges nothing                                                                                                                    | ✅ State machine · 12 tests                                 |
-| **Marketplace Royalties** | Asset sales with configurable basis-point royalty distribution — pays no recipients                                                                                                                                | ✅ State machine · 10 tests                                 |
+| **Marketplace Royalties** | Asset sales with configurable basis-point royalty distribution (`set_royalty → distribute / settle_sale / settle_sales`) — **real SEP-41 payout** of the royalty share and atomic batch settlement | ✅ **Royalty settlement** · 49 tests |
+| **Escrow**                | Three-party escrow holding real SEP-41 tokens: `create → deposit → release / refund / dispute → resolve / cancel`, arbiter-enforced dispute flow, lifecycle events, per-record persistent storage with TTL keeping | ✅ **Flagship** · conservation property verified |
+| **Vesting**               | Time-locked token release with cliff and linear release (`create_schedule → claim / claimable`) — `claim` settles through a real SEP-41 transfer                                                                   | ✅ Settlement |
+| **Multi-Sig Wallet**      | Multi-owner wallet with configurable approval thresholds (`initialize → submit → confirm → execute`), typed withdrawals, rolling limits, and threshold-gated owner-set/threshold governance (`add_owner` / `remove_owner` / `set_threshold`) | ✅ Settlement · 100 tests |
+| **DAO Governance**        | On-chain proposals, one-vote-per-voter voting, deadline enforcement, and finalisation — SEP-41 proposal bonds pulled at `propose` and refunded/forfeited on settlement; dispatches approved actions on-chain | ✅ **Bond settlement** · 60 tests |
+| **Subscription Payments** | Recurring billing with provider opt-in (`subscribe` / `subscribe_on_behalf_of` → `charge` / `pause` / `resume` / `cancel`) — `charge` executes a real subscriber → provider SEP-41 transfer with past-due retry and auto-cancel | ✅ Settlement · 57 tests |
+| **Marketplace Royalties** | Asset sales with configurable basis-point royalty distribution — `settle_sale` pays seller and recipient via real SEP-41 transfers                                                                                   | ✅ Settlement |
 
 Implementation work is tracked as scoped, labeled
 [issues](https://github.com/Meet-hybrid/soroban-forge/issues).
@@ -161,7 +167,12 @@ soroban-forge/
 │   └── marketplace-royalties/
 ├── packages/                 # Language bindings and example apps
 │   ├── typescript-sdk/       # @soroban-forge/escrow-client (generated from the deployed escrow ABI)
-│   ├── nextjs-example/       # Next.js reference application
+│   ├── vesting-client/       # @soroban-forge/vesting-client (generated)
+│   ├── multi-sig-wallet-client/  # @soroban-forge/multi-sig-wallet-client (generated)
+│   ├── subscription-payments-client/  # @soroban-forge/subscription-payments-client (generated)
+│   ├── marketplace-royalties-client/  # @soroban-forge/marketplace-royalties-client (generated)
+│   ├── dao-governance-client/  # @soroban-forge/dao-governance-client (generated)
+│   ├── nextjs-example/       # Next.js testnet escrow demo (Freighter wallet)
 │   └── deployment-templates/ # Docker and deployment templates
 ├── docs/                     # Architecture, tutorials, best practices
 ├── templates/                # Contract scaffolding templates
@@ -207,6 +218,10 @@ cargo build --release --target wasm32v1-none -p soroban-forge-escrow
 cargo run -p soroban-forge-cli -- --help
 cargo run -p soroban-forge-cli -- build --release
 cargo run -p soroban-forge-cli -- test --package soroban-forge-escrow
+
+# New commands for contract interaction
+cargo run -p soroban-forge-cli -- invoke --contract <CONTRACT_ID> --function balance --network testnet
+cargo run -p soroban-forge-cli -- events --contract <CONTRACT_ID> --since <LEDGER> --network testnet
 ```
 
 ### 5. Deploy to testnet
@@ -232,6 +247,24 @@ make format        # cargo fmt --all
 make lint          # cargo clippy --workspace --all-targets -- -D warnings
 make audit         # cargo audit (requires cargo-audit)
 make doc           # open rustdoc
+```
+
+### Regenerate the TypeScript clients
+
+The six `packages/*-client` directories are generated bindings produced from
+each contract's WASM. Regenerate them all from a clean local build with:
+
+```bash
+bash scripts/generate-clients.sh
+```
+
+This builds every contract for `wasm32v1-none` and runs the pinned Stellar
+CLI's `stellar contract bindings typescript --wasm` for each one, wiping and
+rewriting each package directory. Then build the packages:
+
+```bash
+(cd packages/typescript-sdk && npm install && npm run build)
+(cd packages/nextjs-example && npm install && npm run build)
 ```
 
 CI (`.github/workflows/ci.yml`) enforces: **Rustfmt · Clippy (-D warnings) ·

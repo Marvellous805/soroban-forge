@@ -67,8 +67,13 @@ proptest! {
         amount in 1i128..=MAX_AMOUNT,
         bps in 0u32..=10_000_u32,
     ) {
+        // mint_amount == amount: the payer holds exactly the gross sale
+        // amount, so the nested royalty transfer (at most the full amount)
+        // always succeeds and the split math is what the property exercises.
         let w = setup_world(bps, amount);
-        let net = w.client().distribute(&w.collection, &w.seller, &amount);
+        let net = w
+            .client()
+            .distribute(&w.collection, &w.token, &w.payer, &w.seller, &amount);
 
         // Calculate expected royalty share floor
         let expected_royalty = amount * (bps as i128) / 10_000;
@@ -86,12 +91,16 @@ proptest! {
     ) {
         // Zero rate -> full net to seller
         let w_zero = setup_world(0, amount);
-        let net_zero = w_zero.client().distribute(&w_zero.collection, &w_zero.seller, &amount);
+        let net_zero = w_zero
+            .client()
+            .distribute(&w_zero.collection, &w_zero.token, &w_zero.payer, &w_zero.seller, &amount);
         prop_assert_eq!(net_zero, amount, "bps == 0 must return full amount");
 
         // 100% rate -> 0 net to seller
         let w_full = setup_world(10_000, amount);
-        let net_full = w_full.client().distribute(&w_full.collection, &w_full.seller, &amount);
+        let net_full = w_full
+            .client()
+            .distribute(&w_full.collection, &w_full.token, &w_full.payer, &w_full.seller, &amount);
         prop_assert_eq!(net_full, 0, "bps == 10_000 must return 0 net");
     }
 

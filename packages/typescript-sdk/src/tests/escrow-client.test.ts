@@ -5,7 +5,7 @@
  * accounts, or testnet credentials.  They verify:
  *
  *   1. Client construction and configuration surface
- *   2. All 10 generated escrow methods are present
+ *   2. All 11 generated escrow methods are present
  *   3. Argument encoding via ContractSpec.funcArgsToScVals()
  *   4. The ForgeError runtime object (codes and messages)
  *   5. ABI shape — function names, parameter names, and parameter types —
@@ -103,7 +103,7 @@ test("EXPECTED_CONTRACT_ID is a valid Stellar contract address", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Method surface — all 10 escrow methods must be present
+// 2. Method surface — all 11 escrow methods must be present
 // ---------------------------------------------------------------------------
 
 const EXPECTED_METHODS = [
@@ -117,9 +117,10 @@ const EXPECTED_METHODS = [
   "get_escrow",
   "get_status",
   "create_escrow",
+  "escrows_for_participant",
 ] as const;
 
-test("Client exposes all 10 escrow method functions", () => {
+test("Client exposes all 11 escrow method functions", () => {
   const client = new Client({ ...networks.testnet, rpcUrl: DUMMY_RPC_URL });
   for (const method of EXPECTED_METHODS) {
     assert.equal(
@@ -130,7 +131,7 @@ test("Client exposes all 10 escrow method functions", () => {
   }
 });
 
-test("fromJSON exposes deserialization helpers for all 10 methods", () => {
+test("fromJSON exposes deserialization helpers for all 11 methods", () => {
   const client = new Client({ ...networks.testnet, rpcUrl: DUMMY_RPC_URL });
   for (const method of EXPECTED_METHODS) {
     assert.equal(
@@ -156,7 +157,7 @@ test("ContractSpec is accessible via client.spec", () => {
   );
 });
 
-test("ABI exposes exactly the 10 expected function names", () => {
+test("ABI exposes exactly the 11 expected function names", () => {
   const client = new Client({ ...networks.testnet, rpcUrl: DUMMY_RPC_URL });
   const funcNames = client.spec.funcs().map((f) => f.name().toString());
   const sortedExpected = [...EXPECTED_METHODS].sort();
@@ -188,6 +189,11 @@ const EXPECTED_ABI_SHAPE: Record<string, Array<[string, string]>> = {
   touch_ttl: [["escrow_id", "scSpecTypeU64"]],
   get_escrow: [["escrow_id", "scSpecTypeU64"]],
   get_status: [["escrow_id", "scSpecTypeU64"]],
+  escrows_for_participant: [
+    ["participant", "scSpecTypeAddress"],
+    ["cursor", "scSpecTypeU32"],
+    ["limit", "scSpecTypeU32"],
+  ],
   create_escrow: [
     ["buyer", "scSpecTypeAddress"],
     ["seller", "scSpecTypeAddress"],
@@ -368,9 +374,9 @@ test("ForgeError is exported as a runtime object", () => {
   assert.ok(!Array.isArray(ForgeError));
 });
 
-test("ForgeError exposes 11 error codes (1–11)", () => {
+test("ForgeError exposes 13 error codes (1–13)", () => {
   const codes = Object.keys(ForgeError).map(Number).sort((a, b) => a - b);
-  assert.deepEqual(codes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  assert.deepEqual(codes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 });
 
 const EXPECTED_FORGE_ERRORS: Record<number, string> = {
@@ -385,6 +391,8 @@ const EXPECTED_FORGE_ERRORS: Record<number, string> = {
   9: "ArithmeticOverflow",
   10: "Custom",
   11: "TokenTransferFailed",
+  12: "ContractInvocationFailed",
+  13: "WithdrawalLimitExceeded",
 };
 
 test("ForgeError messages match the documented error surface", () => {

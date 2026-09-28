@@ -6,13 +6,16 @@
 //! soroban-forge test --package soroban-forge-escrow
 //! soroban-forge lint --fix
 //! soroban-forge deploy path/to/escrow.wasm --network testnet
+//! soroban-forge verify --wasm path/to/contract.wasm
+//! soroban-forge verify --expected <sha256>
+//! soroban-forge verify --manifest provenance-manifest.json
 //! ```
 
 mod cli;
 mod commands;
 
 use clap::{Parser, Subcommand};
-use cli::{BuildArgs, DeployArgs, LintArgs, NewArgs, TestArgs};
+use cli::{BuildArgs, DeployArgs, EventsArgs, InvokeArgs, LintArgs, NewArgs, TestArgs, VerifyArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +36,9 @@ pub enum Commands {
     Test(TestArgs),
     Deploy(DeployArgs),
     New(NewArgs),
+    Verify(VerifyArgs),
+    Invoke(InvokeArgs),
+    Events(EventsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +51,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Test(args) => commands::test::run(args)?,
         Commands::Deploy(args) => commands::deploy::run(args)?,
         Commands::New(args) => commands::new::run(args)?,
+        Commands::Verify(args) => commands::verify::run(args)?,
+        Commands::Invoke(args) => commands::invoke::run(args)?,
+        Commands::Events(args) => commands::events::run(args)?,
     }
 
     Ok(())
@@ -85,5 +94,50 @@ mod tests {
             .to_string();
         assert!(help.contains("--wasm"));
         assert!(help.contains("--check-size"));
+    }
+
+    #[test]
+    fn verify_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "soroban-forge",
+            "verify",
+            "--wasm",
+            "target/wasm32v1-none/release/soroban_forge_escrow.wasm",
+            "--expected",
+            &"a".repeat(64),
+        ])
+        .unwrap();
+
+        let Commands::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert_eq!(
+            args.wasm.as_deref(),
+            Some("target/wasm32v1-none/release/soroban_forge_escrow.wasm")
+        );
+        assert_eq!(args.expected.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(args.manifest, "provenance-manifest.json");
+    }
+
+    #[test]
+    fn verify_manifest_defaults_to_provenance_manifest() {
+        let cli = Cli::try_parse_from(["soroban-forge", "verify", "--wasm", "x.wasm"]).unwrap();
+        let Commands::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert_eq!(args.manifest, "provenance-manifest.json");
+    }
+
+    #[test]
+    fn verify_help_documents_flags() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("verify")
+            .expect("verify subcommand must exist")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--wasm"));
+        assert!(help.contains("--expected"));
+        assert!(help.contains("--manifest"));
     }
 }

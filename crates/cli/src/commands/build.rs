@@ -6,9 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const WASM_TARGET: &str = "wasm32v1-none";
+pub(crate) const WASM_TARGET: &str = "wasm32v1-none";
 const SIZE_BUDGET_BYTES: u64 = 150_000;
-const CONTRACT_PACKAGES: &[&str] = &[
+pub(crate) const CONTRACT_PACKAGES: &[&str] = &[
     "soroban-forge-escrow",
     "soroban-forge-vesting",
     "soroban-forge-multi-sig-wallet",
@@ -78,7 +78,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-fn ensure_wasm_target_installed() -> Result<()> {
+pub(crate) fn ensure_wasm_target_installed() -> Result<()> {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let output = Command::new(rustc)
         .args(["--print", "target-libdir", "--target", WASM_TARGET])
@@ -111,7 +111,7 @@ fn missing_target_message() -> String {
     )
 }
 
-fn wasm_release_dir() -> PathBuf {
+pub(crate) fn wasm_release_dir() -> PathBuf {
     env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target"))

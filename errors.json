@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "errors": [
+    { "code": 1, "name": "Unauthorized", "doc": "The caller is not permitted to perform this action." },
+    { "code": 2, "name": "NotFound", "doc": "The requested entity (escrow, proposal, subscription, ...) does not exist." },
+    { "code": 3, "name": "InvalidInput", "doc": "One or more arguments failed validation (e.g. zero amount, bad address)." },
+    { "code": 4, "name": "InsufficientFunds", "doc": "The contract does not hold enough balance to satisfy the operation." },
+    { "code": 5, "name": "AlreadyInitialized", "doc": "The entity was already initialised; re-initialisation is rejected." },
+    { "code": 6, "name": "NotInitialized", "doc": "The entity was expected to be initialised but was not." },
+    { "code": 7, "name": "DeadlineReached", "doc": "An operation was attempted after its deadline elapsed." },
+    { "code": 8, "name": "InsufficientAllowance", "doc": "A required token allowance was lower than the amount being spent." },
+    { "code": 9, "name": "ArithmeticOverflow", "doc": "An arithmetic operation overflowed." },
+    { "code": 10, "name": "Custom", "doc": "Contract-specific error that does not map to the categories above." },
+    { "code": 11, "name": "TokenTransferFailed", "doc": "A SEP-41 token invocation failed (insufficient balance, missing or deauthorized trustline, undeployed token contract, or token-logic rejection). The raw token error discriminant is intentionally not forwarded — callers cannot tell which contract produced a forwarded code, so it is bucketed; the root cause remains visible in the transaction's diagnostic events." },
+    { "code": 12, "name": "ContractInvocationFailed", "doc": "A cross-contract invocation failed (target reverted or host abort). The target reverts are surfaced here so the caller can distinguish them from token-transfer failures, and the invoking transaction is left un-executed." },
+    { "code": 13, "name": "WithdrawalLimitExceeded", "doc": "The requested withdrawal would push a token's rolling-window total past its configured withdrawal limit. Kept distinct from [`ForgeError::InvalidInput`] so a caller can tell a policy rejection (a valid withdrawal that is too large right now) from a malformed argument." }
+  ]
+}

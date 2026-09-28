@@ -12,9 +12,11 @@
 //!
 //! ```text
 //! set_royalty(collection, recipient, bps)   -> Active config
-//! distribute(collection, seller, amount)    -> computes `amount * bps / 10_000`
-//!                                              for the recipient and returns
-//!                                              the net owed to the seller
+//! distribute(collection, token, payer,
+//!             seller, amount)               -> transfers `amount * bps / 10_000`
+//!                                              from `payer` to the recipient,
+//!                                              returns the net owed to the
+//!                                              seller
 //! settle_sale(collection, token, payer,
 //!             seller, amount)               -> transfers the seller net, then
 //!                                              the royalty share, then commits
@@ -33,9 +35,11 @@
 //! Authorization model:
 //! - `set_royalty` requires the collection (the contract whose config this
 //!   is), and `bps` must not exceed 100% (10_000 bps).
-//! - `distribute` requires the collection and returns the seller's net after
-//!   the configured royalty split; a `Disabled` configuration settles in full
-//!   to the seller. It computes only and moves no tokens.
+//! - `distribute` requires the collection (as `settle_sale` does) and the
+//!   `payer`, whose authorization covers the nested royalty transfer to the
+//!   configured recipient; it returns the seller's net after the configured
+//!   royalty split, and a `Disabled` configuration settles in full by
+//!   transferring nothing.
 //! - `settle_sale` requires the collection (as `distribute` does) and the
 //!   `payer`, whose balance funds both transfers; the payer's authorization
 //!   covers the nested token invocations exactly as escrow's does.
@@ -44,19 +48,20 @@
 //!   nested token transfer in the batch — no per-sale re-authorization.
 //! - `get_royalty` and `get_settlement_summary` are read-only views.
 //!
-//! Settlement follows escrow's transfer-before-state ordering: both token
-//! transfers run before any settlement state is committed, the royalty
-//! recipient is paid last so a failed transfer can never leave it partially
-//! paid, and token failures are bucketed into `TokenTransferFailed`. Any
-//! returned error rolls the whole invocation back. `settle_sales` extends
-//! that discipline to the batch: every fallible step (configuration load,
-//! the [`MAX_SETTLE_SALES`] cap, per-sale `amount > 0`, the per-sale split
-//! math, and the aggregate check against the stored summary) runs before
-//! the first transfer, the summary is written once per call, and a failure
-//! in any sale — including a later sale's transfer — reverts the entire
-//! invocation, so no sale in the batch is ever half-settled. Multiple
-//! recipients per collection and per-token royalties remain out of scope
-//! for this iteration.
+//! Settlement follows escrow's transfer-before-state ordering: all token
+//! transfers run before any settlement state is committed, `settle_sale`
+//! pays the royalty recipient last so a failed transfer can never leave it
+//! partially paid, `distribute` pays only the royalty recipient (the
+//! seller's net is the caller's responsibility), and token failures are
+//! bucketed into `TokenTransferFailed`. Any returned error rolls the whole
+//! invocation back. `settle_sales` extends that discipline to the batch:
+//! every fallible step (configuration load, the [`MAX_SETTLE_SALES`] cap,
+//! per-sale `amount > 0`, the per-sale split math, and the aggregate check
+//! against the stored summary) runs before the first transfer, the summary
+//! is written once per call, and a failure in any sale — including a later
+//! sale's transfer — reverts the entire invocation, so no sale in the batch
+//! is ever half-settled. Multiple recipients per collection and per-token
+//! royalties remain out of scope for this iteration.
 
 #[cfg(test)]
 extern crate std;
@@ -107,9 +112,17 @@ pub trait SorobanForgeMarketplaceRoyalties {
 
     /// Distribute `amount` from a sale of `collection`, returning the net to
     /// the seller after royalties. Pure computation: no tokens move.
+    /// Distribute the royalty share of `amount` from a sale of `collection`:
+    /// transfer it from `payer` to the configured recipient in `token` and
+    /// return the net owed to the seller after royalties. A standalone
+    /// royalty settlement for cases where the underlying sale/payment is
+    /// handled outside `settle_sale` — the seller's net is not transferred
+    /// here.
     fn distribute(
         env: Env,
         collection: Address,
+        token: Address,
+        payer: Address,
         seller: Address,
         amount: i128,
     ) -> Result<i128, soroban_forge_shared_utils::ForgeError>;
@@ -333,15 +346,30 @@ impl MarketplaceRoyalties {
     }
 
     /// Compute the royalty split for a sale.
+    /// Distribute the royalty share of `amount` from a sale of `collection`
+    /// in `token`.
     ///
-    /// Requires the collection's authorization and `amount > 0`. Returns the
-    /// net owed to `seller` after reserving `amount * bps / 10_000` for the
-    /// configured recipient. A `Disabled` configuration settles in full.
-    /// This entrypoint is a pure computation and moves no tokens; use
-    /// `settle_sale` to transfer the split in real SEP-41 tokens.
+    /// Requires the collection's authorization (the payer's authorization
+    /// covers the nested token transfer, exactly as `settle_sale`) and
+    /// `amount > 0`. Computes the split with
+    /// [`split`] — the same math as `settle_sale` — then transfers only the
+    /// royalty share from `payer` to the configured recipient **before any
+    /// settlement state is committed**. The `seller`'s net is *not*
+    /// transferred here: this is a standalone royalty settlement for cases
+    /// where the underlying sale/payment is handled outside `settle_sale`,
+    /// so the caller is responsible for paying the seller separately. The
+    /// net is still returned so the caller knows what the seller is owed.
+    /// A `Disabled` or zero-bps configuration transfers nothing (share is
+    /// zero) and settles in full to the seller by returning the full
+    /// amount. Token failures are bucketed into
+    /// [`ForgeError::TokenTransferFailed`], and any returned error rolls
+    /// the whole invocation back — a failed transfer never commits totals.
+    /// The contract never takes custody of tokens.
     pub fn distribute(
         env: Env,
         collection: Address,
+        token: Address,
+        payer: Address,
         seller: Address,
         amount: i128,
     ) -> Result<i128, ForgeError> {
@@ -354,9 +382,38 @@ impl MarketplaceRoyalties {
             return Err(ForgeError::InvalidInput);
         }
         collection.require_auth();
+        payer.require_auth();
 
-        let _ = &seller;
-        let (_, seller_net) = split(amount, effective_bps(&royalty))?;
+        // Every fallible computation runs before the transfer, so an
+        // arithmetic failure can never strand funds mid-settlement.
+        let (royalty_share, seller_net) = split(amount, effective_bps(&royalty))?;
+        let summary = next_summary(&env, &collection, 1, amount, royalty_share)?;
+
+        // Transfer-before-state (escrow pattern): the royalty recipient is
+        // paid only after the split math succeeded and before any
+        // accounting state is committed.
+        if royalty_share > 0 {
+            transfer(&env, &token, &payer, &royalty.recipient, royalty_share)?;
+        }
+
+        // Only after the transfer succeeded commit settlement state.
+        let summary_key = DataKey::Summary(collection.clone());
+        let royalty_key = DataKey::Royalty(collection.clone());
+        env.storage().persistent().set(&summary_key, &summary);
+        bump_entry(&env, &royalty_key);
+        bump_entry(&env, &summary_key);
+        events::sale_settled(
+            &env,
+            &collection,
+            &token,
+            &payer,
+            &seller,
+            &royalty.recipient,
+            amount,
+            seller_net,
+            royalty_share,
+        );
+
         Ok(seller_net)
     }
 
@@ -845,47 +902,167 @@ mod tests {
 
     #[test]
     fn distribute_pays_royalty_and_returns_net() {
-        let (_env, client, accounts) = setup!();
+        let (_env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
         // 1000 units sold with a 5% royalty -> 50 to the recipient, 950 net.
-        let net = client.distribute(&accounts.arbiter, &accounts.user1, &1_000_i128);
+        let net = client.distribute(collection, &token, payer, seller, &1_000_i128);
         assert_eq!(net, 950);
+        assert_eq!(tc.balance(payer), 950, "payer funds the royalty share");
+        assert_eq!(tc.balance(recipient), 50);
+        assert_eq!(tc.balance(seller), 0, "distribute does not pay the seller");
+        // The contract settles through and never retains funds.
+        assert_eq!(tc.balance(&contract_id), 0);
+
+        let summary = client.get_settlement_summary(collection);
+        assert_eq!(summary.sales, 1);
+        assert_eq!(summary.gross_volume, 1_000);
+        assert_eq!(summary.royalties_paid, 50);
     }
 
     #[test]
-    fn distribute_zero_bps_returns_full_amount() {
-        let (_env, client, accounts) = setup!();
-        client.set_royalty(&accounts.arbiter, &accounts.user2, &0_u32);
-        let net = client.distribute(&accounts.arbiter, &accounts.user1, &1_000_i128);
+    fn distribute_zero_bps_transfers_nothing() {
+        let (_env, token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+        client.set_royalty(collection, recipient, &0_u32);
+
+        let net = client.distribute(collection, &token, payer, seller, &1_000_i128);
         assert_eq!(net, 1_000);
+        assert_eq!(tc.balance(payer), 1_000, "no transfer at zero bps");
+        assert_eq!(tc.balance(recipient), 0);
+        assert_eq!(client.get_settlement_summary(collection).royalties_paid, 0);
     }
 
     #[test]
-    fn distribute_100_percent_returns_zero_net() {
-        let (_env, client, accounts) = setup!();
-        client.set_royalty(&accounts.arbiter, &accounts.user2, &10_000_u32);
-        let net = client.distribute(&accounts.arbiter, &accounts.user1, &1_000_i128);
+    fn distribute_100_percent_transfers_full_amount_to_recipient() {
+        let (_env, token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+        client.set_royalty(collection, recipient, &10_000_u32);
+
+        let net = client.distribute(collection, &token, payer, seller, &1_000_i128);
         assert_eq!(net, 0);
+        assert_eq!(tc.balance(payer), 0);
+        assert_eq!(tc.balance(recipient), 1_000);
     }
 
     #[test]
     fn distribute_rejects_non_positive_amount() {
-        let (_env, client, accounts) = setup!();
-        let err = client
-            .try_distribute(&accounts.arbiter, &accounts.user1, &0_i128)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ForgeError::InvalidInput);
+        let (_env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
+        for amount in [0_i128, -100] {
+            let err = client
+                .try_distribute(collection, &token, payer, seller, &amount)
+                .unwrap_err()
+                .unwrap();
+            assert_eq!(err, ForgeError::InvalidInput);
+        }
     }
 
     #[test]
     fn distribute_missing_config_is_not_found() {
-        let (_env, client, accounts) = setup!();
+        let (_env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let seller = &accounts.user3;
         // An unregistered collection has no config.
         let err = client
-            .try_distribute(&accounts.validator, &accounts.user1, &1_000_i128)
+            .try_distribute(&accounts.validator, &token, payer, seller, &1_000_i128)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn distribute_disabled_collection_transfers_nothing() {
+        let (env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
+        // Same gap as the settle suite: `set_royalty` has no public
+        // "disable" switch, so write the `Disabled` record directly — a
+        // disabled config must distribute in full to the seller (no
+        // transfer, full net returned).
+        let disabled = Royalty {
+            collection: collection.clone(),
+            recipient: recipient.clone(),
+            bps: 500,
+            status: RoyaltyStatus::Disabled,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Royalty(collection.clone()), &disabled);
+        });
+
+        let net = client.distribute(collection, &token, payer, seller, &1_000_i128);
+        assert_eq!(net, 1_000);
+        assert_eq!(tc.balance(payer), 1_000, "disabled config moves nothing");
+        assert_eq!(tc.balance(recipient), 0);
+    }
+
+    #[test]
+    fn distribute_insufficient_payer_balance_fails_and_commits_nothing() {
+        let (_env, token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
+        // The payer holds 1_000 but the 5% royalty on a 100_000 sale is
+        // 5_000 — the single transfer fails at the token.
+        let err = client
+            .try_distribute(collection, &token, payer, seller, &100_000_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::TokenTransferFailed);
+        assert_eq!(tc.balance(payer), 1_000);
+        assert_eq!(tc.balance(recipient), 0);
+        assert_eq!(
+            client
+                .try_get_settlement_summary(collection)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound,
+            "no settlement state is committed on failure"
+        );
+    }
+
+    #[test]
+    fn distribute_with_undeployed_token_fails_and_moves_nothing() {
+        let (env, _token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+        let not_a_token = Address::generate(&env);
+
+        let err = client
+            .try_distribute(collection, &not_a_token, payer, seller, &1_000_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::TokenTransferFailed);
+        assert_eq!(tc.balance(payer), 1_000);
+        assert_eq!(tc.balance(recipient), 0);
+        assert_eq!(
+            client
+                .try_get_settlement_summary(collection)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound
+        );
     }
 
     #[test]
@@ -896,20 +1073,6 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::NotFound);
-    }
-
-    #[test]
-    fn distribute_disabled_collection_settles_in_full() {
-        let (_env, client, accounts) = setup!();
-        // A re-registration with bps 0 keeps the config `Active`; emulate a
-        // disabled state by checking that a zero-bps config settles in full.
-        client.set_royalty(&accounts.arbiter, &accounts.user2, &0_u32);
-        assert_eq!(
-            client.get_royalty(&accounts.arbiter).status,
-            RoyaltyStatus::Active
-        );
-        let net = client.distribute(&accounts.arbiter, &accounts.user1, &1_000_i128);
-        assert_eq!(net, 1_000);
     }
 
     // -------------------------------------------------------------------

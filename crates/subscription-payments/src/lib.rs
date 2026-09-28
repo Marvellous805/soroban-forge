@@ -22,6 +22,11 @@
 //!
 //! Authorization model:
 //! - `subscribe` requires the subscriber (who authorises the agreement).
+//! - `authorize_provider` requires the subscriber (who consents to the
+//!   provider-initiated relationship).
+//! - `revoke_provider` requires the subscriber (who withdraws that consent).
+//! - `subscribe_on_behalf_of` requires the provider **and** an explicit
+//!   opt-in from the subscriber for that provider.
 //! - `charge` requires the provider (who pulls payment) and bills when a
 //!   full period has elapsed since the last charge, executing a SEP-41 token
 //!   transfer from subscriber to provider.
@@ -32,7 +37,43 @@
 //! - `pause` requires the subscriber.
 //! - `resume` requires the subscriber.
 //! - `cancel` requires the subscriber (works from `Active`, `Paused`, or `PastDue`).
-//! - `get_subscription` is a read-only view.
+//! - read-only views (`get_subscription`, `get_subscription_count`,
+//!   `subscriptions_for_subscriber`, `subscriptions_for_provider`,
+//!   `is_provider_authorized`) require no authorization.
+//!
+//! | Entrypoint                 | Required authorization             |
+//! | -------------------------- | ---------------------------------- |
+//! | `subscribe`                | subscriber                         |
+//! | `authorize_provider`       | subscriber                         |
+//! | `revoke_provider`          | subscriber                         |
+//! | `subscribe_on_behalf_of`   | provider + valid subscriber opt-in |
+//! | `charge`                   | provider (existing authorization)  |
+//! | `pause`                    | subscriber                         |
+//! | `resume`                   | subscriber                         |
+//! | `cancel`                   | subscriber                         |
+//! | read methods               | none                               |
+//!
+//! ## Provider opt-in (explicit consent)
+//!
+//! A provider-initiated subscription (`subscribe_on_behalf_of`) is only
+//! accepted for a provider the subscriber has **explicitly authorized** on
+//! chain. The consent lives in instance storage under
+//! [`DataKey::ProviderOptIn`], keyed by `(subscriber, provider)`; it is
+//! written by `authorize_provider` and removed by `revoke_provider`, both
+//! of which require the subscriber's authorization.
+//!
+//! The security property this preserves: a provider cannot create a
+//! subscription that can later pull subscriber funds without the
+//! subscriber's explicit on-chain consent. `charge` still authorizes
+//! through the provider, so a subscription created by `subscribe` (subscriber
+//! authorized at creation) remains fully chargeable, while a provider-created
+//! subscription can only exist for a relationship the subscriber chose.
+//!
+//! The opt-in is a narrow, per-relationship flag — not a general permission
+//! framework. Both path's records are stored in the same
+//! [`Subscription`] shape with the same sequential id counter, so
+//! [`get_subscription`] cannot distinguish a subscriber-created from a
+//! provider-created record, and no consent-origin field is needed.
 
 #[cfg(test)]
 extern crate std;
@@ -61,6 +102,64 @@ pub trait SorobanForgeSubscriptionPayments {
         env: Env,
         subscriber: Address,
         provider: Address,
+        token: Address,
+        amount: i128,
+        period: u64,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Explicitly authorize `provider` to create subscriptions on
+    /// `subscriber`'s behalf (see the module docs on provider opt-in).
+    ///
+    /// Requires the subscriber. Idempotent: authorizing a provider that is
+    /// already authorized succeeds.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::Unauthorized`] — the caller is not `subscriber`.
+    fn authorize_provider(
+        env: Env,
+        subscriber: Address,
+        provider: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Withdraw `subscriber`'s explicit authorization of `provider` (see the
+    /// module docs on provider opt-in).
+    ///
+    /// Requires the subscriber. Idempotent: revoking a provider that is not
+    /// authorized succeeds and leaves the opt-in absent.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::Unauthorized`] — the caller is not `subscriber`.
+    fn revoke_provider(
+        env: Env,
+        subscriber: Address,
+        provider: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Read whether `subscriber` has explicitly authorized `provider`
+    /// (read-only view; requires no authorization).
+    fn is_provider_authorized(env: Env, subscriber: Address, provider: Address) -> bool;
+
+    /// Subscribe `subscriber` to `provider`'s service on the provider's
+    /// initiative, at `amount` per `period`. Returns the stable
+    /// subscription id.
+    ///
+    /// Requires the provider and an explicit subscriber opt-in for that
+    /// provider (see [`authorize_provider`]). The subscriber is **not**
+    /// authorized at creation: the opt-in is the consent. Creates a normal
+    /// subscription record indistinguishable from one created by
+    /// [`subscribe`], sharing the same sequential id counter.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::Unauthorized`] — the caller is not `provider`, or the
+    ///   subscriber has not authorized the provider.
+    /// * [`ForgeError::InvalidInput`] — `amount` or `period` is not positive.
+    fn subscribe_on_behalf_of(
+        env: Env,
+        provider: Address,
+        subscriber: Address,
         token: Address,
         amount: i128,
         period: u64,
@@ -209,6 +308,10 @@ enum DataKey {
     /// Creation-order subscription ids for which the `Address` is the
     /// provider, in id order. Written once per `subscribe`.
     ProviderSubscriptions(Address),
+    /// Explicit subscriber opt-in for a provider-initiated subscription:
+    /// `(subscriber, provider)`. Written by `authorize_provider`, removed by
+    /// `revoke_provider`, consulted by `subscribe_on_behalf_of`.
+    ProviderOptIn(Address, Address),
 }
 
 /// The deployable subscription payments contract.
@@ -266,6 +369,90 @@ impl SubscriptionPayments {
         );
         events::subscribed(&env, &subscription);
         Ok(subscription_id)
+        Self::create_subscription(&env, subscriber, provider, token, amount, period)
+    }
+
+    /// Explicitly authorize `provider` to create subscriptions on
+    /// `subscriber`'s behalf (see the module docs on provider opt-in).
+    ///
+    /// Requires the subscriber. Idempotent: authorizing a provider that is
+    /// already authorized succeeds.
+    pub fn authorize_provider(
+        env: Env,
+        subscriber: Address,
+        provider: Address,
+    ) -> Result<(), ForgeError> {
+        subscriber.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProviderOptIn(subscriber, provider), &true);
+        Ok(())
+    }
+
+    /// Withdraw `subscriber`'s explicit authorization of `provider` (see the
+    /// module docs on provider opt-in).
+    ///
+    /// Requires the subscriber. Idempotent: revoking a provider that is not
+    /// authorized succeeds and leaves the opt-in absent.
+    pub fn revoke_provider(
+        env: Env,
+        subscriber: Address,
+        provider: Address,
+    ) -> Result<(), ForgeError> {
+        subscriber.require_auth();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::ProviderOptIn(subscriber, provider));
+        Ok(())
+    }
+
+    /// Read whether `subscriber` has explicitly authorized `provider`
+    /// (read-only view; requires no authorization).
+    pub fn is_provider_authorized(env: Env, subscriber: Address, provider: Address) -> bool {
+        Self::is_provider_authorized_impl(&env, &subscriber, &provider)
+    }
+
+    fn is_provider_authorized_impl(env: &Env, subscriber: &Address, provider: &Address) -> bool {
+        env.storage().instance().has(&DataKey::ProviderOptIn(
+            subscriber.clone(),
+            provider.clone(),
+        ))
+    }
+
+    /// Subscribe `subscriber` to `provider`'s service on the provider's
+    /// initiative (see the module docs on provider opt-in).
+    ///
+    /// Requires `amount > 0`, `period > 0`, the provider's authorization, and
+    /// an explicit subscriber opt-in for the provider (checked before the
+    /// provider is authorized, so a missing opt-in surfaces without spending
+    /// the provider's signature). The subscriber is **not** authorized at
+    /// creation. The record is created through the same internal path as
+    /// [`subscribe`], sharing the same sequential id counter.
+    pub fn subscribe_on_behalf_of(
+        env: Env,
+        provider: Address,
+        subscriber: Address,
+        token: Address,
+        amount: i128,
+        period: u64,
+    ) -> Result<u64, ForgeError> {
+        if amount <= 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        if period == 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        // The opt-in is the subscriber's consent: without it, a provider
+        // must not be able to stand up a subscription that later pulls
+        // subscriber funds.
+        if !Self::is_provider_authorized_impl(&env, &subscriber, &provider) {
+            return Err(ForgeError::Unauthorized);
+        }
+        provider.require_auth();
+
+        Self::create_subscription(&env, subscriber, provider, token, amount, period)
     }
 
     /// Bill one due period.
@@ -517,6 +704,53 @@ impl SubscriptionPayments {
         Self::resolve_page(&env, &ids, offset, limit)
     }
 
+    /// Create a new subscription through the single shared creation path used
+    /// by both `subscribe` and `subscribe_on_behalf_of`.
+    ///
+    /// Callers must have completed validation and authorization; this helper
+    /// allocates the id, writes the record, and appends both indexes. Index
+    /// writes join the success path after every fallible step (validation,
+    /// `require_auth`, id allocation), so they cannot observe or create
+    /// partial state. Records created through either entrypoint are
+    /// indistinguishable from `get_subscription`'s perspective and draw
+    /// from the same sequential counter.
+    fn create_subscription(
+        env: &Env,
+        subscriber: Address,
+        provider: Address,
+        token: Address,
+        amount: i128,
+        period: u64,
+    ) -> Result<u64, ForgeError> {
+        let subscription_id = Self::next_id(env)?;
+        let subscription = Subscription {
+            subscription_id,
+            subscriber: subscriber.clone(),
+            provider: provider.clone(),
+            token,
+            amount,
+            period,
+            last_charged: env.ledger().timestamp(),
+            status: SubscriptionStatus::Active,
+            paused_at: None,
+            failed_attempts: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::append_index(
+            env,
+            &DataKey::SubscriberSubscriptions(subscriber),
+            subscription_id,
+        );
+        Self::append_index(
+            env,
+            &DataKey::ProviderSubscriptions(provider),
+            subscription_id,
+        );
+        Ok(subscription_id)
+    }
+
     /// Allocate the next monotonic subscription id.
     fn next_id(env: &Env) -> Result<u64, ForgeError> {
         let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
@@ -591,17 +825,6 @@ mod events {
     use super::*;
 
     #[contractevent]
-    pub struct Subscribed {
-        #[topic]
-        pub subscription_id: u64,
-        pub subscriber: Address,
-        pub provider: Address,
-        pub token: Address,
-        pub amount: i128,
-        pub period: u64,
-    }
-
-    #[contractevent]
     pub struct Charged {
         #[topic]
         pub subscription_id: u64,
@@ -615,18 +838,6 @@ mod events {
         #[topic]
         pub subscription_id: u64,
         pub subscriber: Address,
-    }
-
-    pub fn subscribed(env: &Env, subscription: &Subscription) {
-        Subscribed {
-            subscription_id: subscription.subscription_id,
-            subscriber: subscription.subscriber.clone(),
-            provider: subscription.provider.clone(),
-            token: subscription.token.clone(),
-            amount: subscription.amount,
-            period: subscription.period,
-        }
-        .publish(env);
     }
 
     pub fn charged(env: &Env, subscription: &Subscription) {
@@ -732,6 +943,153 @@ mod tests {
             &PERIOD,
         );
         assert_ne!(subscription_id, id2);
+    }
+
+    #[test]
+    fn subscribe_on_behalf_of_creates_equivalent_active_subscription() {
+        let (_env, token, _tc, _contract_id, client, accounts, _id) = setup!();
+        client.authorize_provider(&accounts.user1, &accounts.validator);
+        let id = client.subscribe_on_behalf_of(
+            &accounts.validator,
+            &accounts.user1,
+            &token,
+            &AMOUNT,
+            &PERIOD,
+        );
+
+        let sub = client.get_subscription(&id);
+        assert_eq!(sub.subscriber, accounts.user1);
+        assert_eq!(sub.provider, accounts.validator);
+        assert_eq!(sub.amount, AMOUNT);
+        assert_eq!(sub.status, SubscriptionStatus::Active);
+        assert_eq!(sub.last_charged, client.env.ledger().timestamp());
+        // Both creation paths feed the same indexes.
+        assert_eq!(
+            client
+                .subscriptions_for_subscriber(&accounts.user1, &0, &10)
+                .len(),
+            2
+        );
+        assert_eq!(
+            client
+                .subscriptions_for_provider(&accounts.validator, &0, &10)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn subscribe_on_behalf_of_requires_opt_in() {
+        let (_env, token, _tc, _contract_id, client, accounts, _id) = setup!();
+        let err = client
+            .try_subscribe_on_behalf_of(
+                &accounts.validator,
+                &accounts.user1,
+                &token,
+                &AMOUNT,
+                &PERIOD,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::Unauthorized);
+
+        // Revoking consent blocks later provider-initiated creations too.
+        client.authorize_provider(&accounts.user1, &accounts.validator);
+        client.revoke_provider(&accounts.user1, &accounts.validator);
+        let err = client
+            .try_subscribe_on_behalf_of(
+                &accounts.validator,
+                &accounts.user1,
+                &token,
+                &AMOUNT,
+                &PERIOD,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::Unauthorized);
+    }
+
+    #[test]
+    fn subscribe_on_behalf_of_rejects_invalid_amount_and_period() {
+        let (_env, token, _tc, _contract_id, client, accounts, _id) = setup!();
+        client.authorize_provider(&accounts.user1, &accounts.validator);
+
+        let err = client
+            .try_subscribe_on_behalf_of(
+                &accounts.validator,
+                &accounts.user1,
+                &token,
+                &0_i128,
+                &PERIOD,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        let err = client
+            .try_subscribe_on_behalf_of(
+                &accounts.validator,
+                &accounts.user1,
+                &token,
+                &AMOUNT,
+                &0_u64,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        // No partial record from the failed calls.
+        assert_eq!(client.get_subscription_count(), 1);
+    }
+
+    #[test]
+    fn subscription_ids_are_sequential_across_both_paths() {
+        let (_env, token, _tc, _contract_id, client, accounts, subscription_id) = setup!();
+        assert_eq!(subscription_id, 1);
+
+        client.authorize_provider(&accounts.user2, &accounts.validator);
+        let id2 = client.subscribe_on_behalf_of(
+            &accounts.validator,
+            &accounts.user2,
+            &token,
+            &AMOUNT,
+            &PERIOD,
+        );
+        assert_eq!(id2, 2);
+
+        let id3 = client.subscribe(
+            &accounts.user3,
+            &accounts.arbiter,
+            &accounts.deployer,
+            &AMOUNT,
+            &PERIOD,
+        );
+        assert_eq!(id3, 3);
+
+        client.authorize_provider(&accounts.user1, &accounts.arbiter);
+        let id4 = client.subscribe_on_behalf_of(
+            &accounts.arbiter,
+            &accounts.user1,
+            &accounts.deployer,
+            &AMOUNT,
+            &PERIOD,
+        );
+        assert_eq!(id4, 4);
+        assert_eq!(client.get_subscription_count(), 4);
+    }
+
+    #[test]
+    fn authorize_provider_is_idempotent() {
+        let (_env, _token, _tc, _contract_id, client, accounts, _id) = setup!();
+        client.authorize_provider(&accounts.user1, &accounts.validator);
+        client.authorize_provider(&accounts.user1, &accounts.validator);
+        assert!(client.is_provider_authorized(&accounts.user1, &accounts.validator));
+    }
+
+    #[test]
+    fn revoke_provider_is_idempotent() {
+        let (_env, _token, _tc, _contract_id, client, accounts, _id) = setup!();
+        client.revoke_provider(&accounts.user1, &accounts.validator);
+        assert!(!client.is_provider_authorized(&accounts.user1, &accounts.validator));
     }
 
     #[test]

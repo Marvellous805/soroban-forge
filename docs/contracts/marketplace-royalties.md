@@ -1,9 +1,9 @@
 # Marketplace Royalties Contract
 
 NFT / digital asset sales with configurable royalty distribution across
-secondary sales — computed by `distribute` and settled atomically in real
-SEP-41 tokens by `settle_sale` (one sale) or `settle_sales` (a capped,
-all-or-nothing batch).
+secondary sales — distributed by `distribute` (real SEP-41 royalty payout)
+and settled atomically in real SEP-41 tokens by `settle_sale` (one sale) or
+`settle_sales` (a capped, all-or-nothing batch).
 
 ## Interface
 
@@ -12,6 +12,7 @@ fn set_royalty(collection, recipient, bps) -> Result<(), ForgeError>
 fn disable_royalty(collection) -> Result<(), ForgeError>
 fn enable_royalty(collection) -> Result<(), ForgeError>
 fn distribute(collection, seller, amount) -> Result<i128, ForgeError>
+fn distribute(collection, token, payer, seller, amount) -> Result<i128, ForgeError>
 fn settle_sale(collection, token, payer, seller, amount) -> Result<Settlement, ForgeError>
 fn settle_sales(collection, token, payer, sales: Vec<(seller, amount)>) -> Result<Vec<Settlement>, ForgeError>
 fn get_royalty(collection) -> Result<Royalty, ForgeError>
@@ -52,8 +53,15 @@ missing trustline, undeployed token) surface as
 whole invocation — a failed settlement can never leave the recipient
 partially paid and never commits totals.
 
-`distribute` stays a pure computation for callers that only need the net; it
-moves no tokens.
+`distribute` is a standalone royalty settlement: it transfers the royalty
+share of `amount` (`amount * bps / 10_000`, floored) from `payer` to the
+configured recipient in `token`, records the settlement totals, and returns
+the seller's net after royalties — the seller is **not** paid here. It is
+for callers that handle the underlying sale/payment outside `settle_sale`
+and only need the royalty leg settled; a `Disabled` or zero-bps
+configuration transfers nothing and returns the full `amount`. It requires
+the collection's and the payer's authorization, and emits the same
+`SaleSettled` event as the settlement entrypoints.
 
 The collection can pause enforcement with `disable_royalty` and restore it
 with `enable_royalty`. Both require collection authorization, return
@@ -97,8 +105,11 @@ they were before the call (no sale is half-settled).
 
 ## Compatibility
 
-`set_royalty`, `distribute`, and `get_royalty` are unchanged. `settle_sale`,
-`settle_sales`, and `get_settlement_summary` are additive; the generated
+`set_royalty` and `get_royalty` are unchanged. `distribute` now takes the
+full settlement context `(collection, token, payer, seller, amount)` — the
+same parameter order as `settle_sale` — and pays the royalty share instead
+of computing it. `settle_sale`, `settle_sales`, and
+`get_settlement_summary` are additive; the generated
 `SorobanForgeMarketplaceRoyaltiesClient` gains all three automatically, and
 `Settlement`/`SettlementSummary` are shared by both settlement
 entrypoints.
@@ -107,7 +118,9 @@ entrypoints.
 
 Persistent storage: `Royalty` configuration records (`DataKey::Royalty(Address)`) and `SettlementSummary` records (`DataKey::Summary(Address)`).
 
-`set_royalty`, `settle_sale`, and `settle_sales` extend persistent storage TTL on every write to a 30-day horizon (`30 * DAY_IN_LEDGERS = 518,400` ledgers).
+`set_royalty`, `distribute`, `settle_sale`, and `settle_sales` extend
+persistent storage TTL on every write to a 30-day horizon
+(`30 * DAY_IN_LEDGERS = 518,400` ledgers).
 
 A permissionless public keeper entrypoint `touch_ttl(collection)` allows anyone to bump persistent storage TTL for a collection's `Royalty` and `Summary` records. If no royalty configuration exists for `collection`, `touch_ttl` returns `ForgeError::NotFound`.
 

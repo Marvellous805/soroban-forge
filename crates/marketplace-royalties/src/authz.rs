@@ -2,7 +2,8 @@
 //!
 //! Authorization model:
 //! - `set_royalty` requires the collection.
-//! - `distribute` requires the collection.
+//! - `distribute` requires the collection and the payer (the payer's
+//!   authorization covers the nested royalty transfer to the recipient).
 //! - `settle_sale` requires the collection and the payer.
 
 use crate::{MarketplaceRoyalties, SorobanForgeMarketplaceRoyaltiesClient};
@@ -100,23 +101,43 @@ fn set_royalty_rejects_signature_from_non_collection() {
 }
 
 #[test]
-fn distribute_accepts_collection_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+fn distribute_accepts_collection_and_payer_signatures() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
-    env.mock_auths(&[MockAuth {
-        address: &collection,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "distribute",
-            args: (&collection, &seller, AMOUNT).into_val(&env),
-            sub_invokes: &[],
+    // Two frames: the collection authorizes the entrypoint, and the payer
+    // authorizes the entrypoint — its frame also carries the nested royalty
+    // transfer to the recipient (50 = 5% of 1_000) as a sub-invocation,
+    // exactly as escrow's deposit carries its nested SAC transfer.
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
         },
-    }]);
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &token,
+                    fn_name: "transfer",
+                    args: (&payer, &recipient, 50_i128).into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+    ]);
 
     let net = client
-        .try_distribute(&collection, &seller, &AMOUNT)
+        .try_distribute(&collection, &token, &payer, &seller, &AMOUNT)
         .expect("outer ok")
         .unwrap();
     assert_eq!(net, 950);
@@ -124,23 +145,82 @@ fn distribute_accepts_collection_signature() {
 
 #[test]
 fn distribute_rejects_seller_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
-    // Seller trying to authorize distribute instead of collection
-    env.mock_auths(&[MockAuth {
-        address: &seller,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "distribute",
-            args: (&collection, &seller, AMOUNT).into_val(&env),
-            sub_invokes: &[],
+    // Seller trying to authorize distribute instead of collection. The
+    // payer's entrypoint frame still carries the nested token transfer, so
+    // only the seller's wrongful collection-frame triggers the abort.
+    env.mock_auths(&[
+        MockAuth {
+            address: &seller,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
         },
-    }]);
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &token,
+                    fn_name: "transfer",
+                    args: (&payer, &recipient, 50_i128).into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+    ]);
 
-    let res = client.try_distribute(&collection, &seller, &AMOUNT);
+    let res = client.try_distribute(&collection, &token, &payer, &seller, &AMOUNT);
     assert_auth_abort!(res);
+}
+
+#[test]
+fn distribute_rejects_payer_signature_without_token_authorization() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    // Only the entrypoint frames are armed; the nested SAC transfer pull
+    // has no authorization. Funds must not move on entrypoint signatures
+    // alone.
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    // The unmatched nested auth is not a root abort: the SAC rejects the
+    // pull and the contract buckets the token error.
+    let res = client.try_distribute(&collection, &token, &payer, &seller, &AMOUNT);
+    assert!(matches!(
+        res,
+        Err(Ok(
+            soroban_forge_shared_utils::ForgeError::TokenTransferFailed
+        ))
+    ));
 }
 
 #[test]

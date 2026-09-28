@@ -1927,8 +1927,20 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "soroban-forge-composition-tests"
+version = "0.2.0"
+dependencies = [
+ "soroban-forge-shared-utils",
+ "soroban-forge-test-utils",
+ "soroban-sdk",
 ]
 
 [[package]]
