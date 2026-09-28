@@ -13,11 +13,70 @@ fn refund(escrow_id) -> Result<(), ForgeError>
 fn dispute(escrow_id, claimant) -> Result<(), ForgeError>
 fn resolve(escrow_id, in_favor_of_seller) -> Result<(), ForgeError>
 fn cancel(escrow_id) -> Result<(), ForgeError>
-fn get_status(escrow_id) -> Result<EscrowStatus, ForgeError>
-fn get_escrow(escrow_id) -> Result<EscrowData, ForgeError>
+fn get_status(escrow_id) -> Result<EscrowStatus, ForgeError>   // either record kind
+fn get_escrow(escrow_id) -> Result<EscrowData, ForgeError>     // single-token records
 fn escrows_for_participant(participant, cursor, limit) -> ParticipantEscrowsPage
-fn touch_ttl(escrow_id) -> Result<(), ForgeError>
+fn touch_ttl(escrow_id) -> Result<(), ForgeError>              // either record kind
+
+// Multi-asset baskets (additive; the single-token interface above is unchanged)
+fn create_basket(buyer, seller, arbiter, assets: Vec<EscrowAsset>, timeout) -> Result<u64, ForgeError>
+fn deposit_basket(escrow_id) -> Result<(), ForgeError>
+fn release_basket(escrow_id) -> Result<(), ForgeError>
+fn release_partial_basket(escrow_id, token, amount) -> Result<(), ForgeError>
+fn refund_basket(escrow_id) -> Result<(), ForgeError>
+fn dispute_basket(escrow_id, claimant) -> Result<(), ForgeError>
+fn resolve_basket(escrow_id, in_favor_of_seller) -> Result<(), ForgeError>
+fn cancel_basket(escrow_id) -> Result<(), ForgeError>
+fn get_basket(escrow_id) -> Result<BasketEscrowData, ForgeError> // basket records
 ```
+
+## Multi-Asset Baskets
+
+A basket is an escrow over an ordered list of legs
+(`EscrowAsset { token, amount, released }`) instead of a single
+`(token, amount)` pair. It is **additive**: `EscrowData`, `DataKey::Escrow(id)`,
+and every single-token event keep their exact shape, so the single-token flow,
+its ABI consumers, and its stored records are untouched.
+
+- **Shared id space.** Baskets draw from the same monotonic `DataKey::Count`
+  sequence as single-token escrows, so an id names exactly one record of one
+  kind. `get_status` / `touch_ttl` work for either kind; `get_escrow` reads
+  single-token records and `get_basket` reads baskets (`NotFound` for the
+  other kind). The participant index is shared and deduplicated per address.
+- **Basket bounds.** 1..=8 legs (`MAX_BASKET_ASSETS`), each `amount > 0`, no
+  token repeated (duplicates are rejected, not merged). `create_basket` is
+  buyer-authorized, list order is preserved, and the assets vector is part of
+  the approved invocation.
+- **All-or-nothing deposit.** `deposit_basket` pulls every leg in list order;
+  a failure on any leg rolls the whole frame back (host rollback), so custody
+  never holds a partial basket and the basket stays `Pending` and retryable.
+  The buyer must authorize **one transfer per leg**.
+- **Per-leg accounting.** `remaining = amount - released` per leg. A basket
+  reaches `Completed` only when **every** leg is fully released, so emptying
+  one leg leaves the basket `Funded` with a zero-balance leg.
+  `release_partial_basket(escrow_id, token, amount)` pays one named leg
+  (unknown token → `NotFound`).
+- **Terminal paths pay every leg.** `release_basket` / `refund_basket` /
+  `resolve_basket` move each leg's remaining balance through the same payout
+  loop, one direction for the whole basket. `refund_basket` keeps the
+  single-token refund party rule (seller pre-deadline, buyer post-deadline).
+  Auth is per entrypoint as with the single-token paths (see the lifecycle
+  diagram below).
+- **Dispute freezes all legs.** `dispute_basket` freezes every leg until the
+  arbiter resolves (`resolve_basket`, arbiter-only, final).
+- **Shared internals.** The single-token paths run through the *same* transfer
+  primitives as baskets (a single-token escrow is a one-leg basket), so the
+  payout loop and its conservation rule literally cannot drift between kinds.
+- **TTL per escrow.** A basket is one persistent entry, extended as a unit;
+  legs can never expire independently.
+
+### Basket events
+
+`BasketCreated`, `BasketDeposited`, `BasketReleased`,
+`BasketPartiallyReleased` (carries `token` + `partial_amount`), `BasketRefunded`,
+`BasketDisputed`, `BasketResolved` (carries `in_favor_of_seller`),
+`BasketCancelled` — each carries the id as topic and the full
+`BasketEscrowData` payload. Single-token event payloads are unchanged.
 
 ## Lifecycle
 
