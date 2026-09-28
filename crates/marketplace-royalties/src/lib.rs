@@ -66,9 +66,9 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{transfer_tokens, ForgeError};
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env,
+    contract, contractclient, contractevent, contractimpl, contracttype, Address, Env,
 };
 
 /// Maximum number of sales one `settle_sales` invocation may settle,
@@ -336,7 +336,7 @@ impl MarketplaceRoyalties {
         // paid only after the split math succeeded and before any
         // accounting state is committed.
         if royalty_share > 0 {
-            transfer(&env, &token, &payer, &royalty.recipient, royalty_share)?;
+            transfer_tokens(&env, &token, &payer, &royalty.recipient, royalty_share)?;
         }
 
         // Only after the transfer succeeded commit settlement state.
@@ -402,10 +402,10 @@ impl MarketplaceRoyalties {
         // and the royalty recipient last, so the protected party is only
         // ever paid when everything before it already succeeded.
         if seller_net > 0 {
-            transfer(&env, &token, &payer, &seller, seller_net)?;
+            transfer_tokens(&env, &token, &payer, &seller, seller_net)?;
         }
         if royalty_share > 0 {
-            transfer(&env, &token, &payer, &royalty.recipient, royalty_share)?;
+            transfer_tokens(&env, &token, &payer, &royalty.recipient, royalty_share)?;
         }
 
         // Both transfers succeeded; only now commit settlement state.
@@ -510,10 +510,10 @@ impl MarketplaceRoyalties {
             let (seller, _) = sales.get(i).ok_or(ForgeError::InvalidInput)?;
             let settlement = settlements.get(i).ok_or(ForgeError::InvalidInput)?;
             if settlement.seller_net > 0 {
-                transfer(&env, &token, &payer, &seller, settlement.seller_net)?;
+                transfer_tokens(&env, &token, &payer, &seller, settlement.seller_net)?;
             }
             if settlement.royalty_share > 0 {
-                transfer(
+                transfer_tokens(
                     &env,
                     &token,
                     &payer,
@@ -637,32 +637,6 @@ fn next_summary(
         },
     };
     Ok(summary)
-}
-
-/// Move `amount` of `token` from `from` to `to`.
-///
-/// Same typed-error bucketing as escrow: a client receiving
-/// `Error(Contract, #N)` cannot know whether `N` came from the token or this
-/// contract, so every token-side failure collapses into
-/// [`ForgeError::TokenTransferFailed`] and the raw discriminant is
-/// discarded; the root cause remains visible in the transaction's
-/// diagnostic events. The payer's authorization on the calling entrypoint
-/// covers the nested token invocation — no allowance is needed for a
-/// `transfer` pull when the holder authorizes the call.
-fn transfer(
-    env: &Env,
-    token: &Address,
-    from: &Address,
-    to: &Address,
-    amount: i128,
-) -> Result<(), ForgeError> {
-    match token::TokenClient::new(env, token).try_transfer(from, to, &amount) {
-        Ok(Ok(())) => Ok(()),
-        // Token returned a typed error (insufficient balance, missing
-        // trustline, custom token logic) or the host aborted (most commonly
-        // an undeployed token address).
-        _ => Err(ForgeError::TokenTransferFailed),
-    }
 }
 
 /// Lifecycle events emitted by the marketplace royalties contract.

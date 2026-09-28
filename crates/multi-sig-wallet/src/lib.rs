@@ -271,9 +271,11 @@ compile_error!(
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{
+    transfer_from_contract, transfer_to_contract, ForgeError,
+};
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    contract, contractclient, contractevent, contractimpl, contracttype, Address, Bytes,
     Env, IntoVal, Symbol, Val, Vec,
 };
 
@@ -1951,54 +1953,6 @@ impl MultiSigWallet {
             .persistent()
             .get(&DataKey::Tx(tx_id))
             .ok_or(ForgeError::NotFound)
-    }
-}
-
-/// Move `amount` of `token` from `from` into this contract.
-///
-/// The depositor's `require_auth` on the calling entrypoint covers the
-/// nested token authorization; no separate allowance is needed for a
-/// `transfer` pull when the holder authorizes the invocation.
-///
-/// Token failures are bucketed into [`ForgeError::TokenTransferFailed`]
-/// rather than forwarded: a client receiving `Error(Contract, #N)` cannot
-/// know whether `N` came from the token or the wallet, and forwarding the
-/// raw discriminant invites silent misinterpretation. The root cause
-/// remains visible in the transaction's diagnostic events.
-fn transfer_to_contract(
-    env: &Env,
-    token: &Address,
-    from: &Address,
-    amount: i128,
-) -> Result<(), ForgeError> {
-    match token::TokenClient::new(env, token).try_transfer(
-        from,
-        env.current_contract_address(),
-        &amount,
-    ) {
-        Ok(Ok(())) => Ok(()),
-        // Token returned a typed error (insufficient balance, missing
-        // trustline, custom token logic) or the host aborted (most
-        // commonly an undeployed token address). The raw discriminant is
-        // intentionally discarded — see the bucketing note above.
-        _ => Err(ForgeError::TokenTransferFailed),
-    }
-}
-
-/// Move `amount` of `token` from this contract to `to`.
-fn transfer_from_contract(
-    env: &Env,
-    token: &Address,
-    to: &Address,
-    amount: i128,
-) -> Result<(), ForgeError> {
-    match token::TokenClient::new(env, token).try_transfer(
-        &env.current_contract_address(),
-        to,
-        &amount,
-    ) {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(ForgeError::TokenTransferFailed),
     }
 }
 
