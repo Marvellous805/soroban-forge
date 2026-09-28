@@ -19,6 +19,31 @@ fn escrows_for_participant(participant, cursor, limit) -> ParticipantEscrowsPage
 fn touch_ttl(escrow_id) -> Result<(), ForgeError>
 ```
 
+## Participant Index and Pagination
+
+Each distinct buyer, seller, and arbiter receives a persistent participant
+index in creation order. Creating an escrow adds its id once to each distinct
+party's list. Cancelling a `Pending` escrow removes its id from all of those
+lists after the status and buyer-authorization checks succeed. Removal keeps
+the remaining ids in their original relative order. `release`, `refund`, and
+`resolve` do not remove ids: those terminal escrow records remain addressable
+through `get_escrow` and participant views. Thus the index contains every
+non-cancelled escrow record, whether pending, funded, or terminal.
+
+`escrows_for_participant` uses live offset pagination over the current
+compacted list. `cursor` is an index offset at the moment of the call, not a
+snapshot token. If cancellation removes an id before a cursor returned by a
+previous page, later ids shift left and continuing from that saved cursor can
+skip an id. Clients that need a complete view after an intervening mutation
+should restart at cursor `0`. Without mutation, replaying `next_cursor` yields
+every indexed id exactly once in creation order. `limit == 0`, cursors past
+the end, and `u32::MAX` cursor/limit values return an empty terminal page
+without overflow.
+
+The invariant is maintained in the successful cancel path only: missing ids,
+non-`Pending` records, and failed authorization do not alter either party's
+index. No entrypoint signatures or generated TypeScript ABI changed.
+
 ## Lifecycle
 
 ```text

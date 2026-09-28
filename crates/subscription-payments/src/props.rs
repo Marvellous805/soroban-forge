@@ -7,7 +7,10 @@
 //!    has elapsed.
 //! 3. Terminal safety: a `Cancelled` subscription never bills.
 
-use crate::{SorobanForgeSubscriptionPaymentsClient, SubscriptionPayments, SubscriptionStatus};
+use crate::{
+    SorobanForgeSubscriptionPaymentsClient, SubscriptionPayments, SubscriptionStatus,
+    MAX_CATCHUP_PERIODS, MAX_RETRIES,
+};
 use proptest::prelude::*;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
@@ -143,5 +146,145 @@ proptest! {
 
         let sub_after_failed_charge = w.client().get_subscription(&id);
         prop_assert_eq!(sub_after_failed_charge.status, SubscriptionStatus::Cancelled);
+    }
+
+    #[test]
+    fn prop_failed_charges_advance_retry_state_without_moving_balances(
+        amount in 1i128..=100_000_i128,
+        balance_percent in 0u32..100_u32,
+        period in 1u64..=MAX_PERIOD,
+        failure_count in 1u32..=MAX_RETRIES,
+    ) {
+        let initial_balance = amount * balance_percent as i128 / 100;
+        let w = setup_world(initial_balance);
+        let id = w.subscribe(amount, period);
+        let token_client = StellarAssetClient::new(&w.env, &w.token);
+        let provider_balance = token_client.balance(&w.provider);
+        w.env.ledger().set_timestamp(START + period);
+
+        let mut previous_failed_attempts = 0;
+        for failure in 1..=failure_count {
+            prop_assert_eq!(w.client().charge(&id), 0);
+
+            let sub = w.client().get_subscription(&id);
+            let status = sub.status.clone();
+            prop_assert!(sub.failed_attempts >= previous_failed_attempts);
+            prop_assert_eq!(sub.failed_attempts, failure);
+            prop_assert_eq!(
+                status.clone(),
+                if failure == MAX_RETRIES {
+                    SubscriptionStatus::Cancelled
+                } else {
+                    SubscriptionStatus::PastDue
+                }
+            );
+            prop_assert_eq!(sub.last_charged, START);
+            prop_assert_eq!(token_client.balance(&w.subscriber), initial_balance);
+            prop_assert_eq!(token_client.balance(&w.provider), provider_balance);
+            previous_failed_attempts = sub.failed_attempts;
+
+            if status == SubscriptionStatus::PastDue {
+                let before = sub;
+                let catchup = w.client().try_charge_catchup(&id, &1);
+                let err = catchup.unwrap_err().unwrap();
+                prop_assert_eq!(err, ForgeError::InvalidInput);
+                prop_assert_eq!(w.client().get_subscription(&id), before);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_catchup_bills_only_due_periods_within_the_hard_cap(
+        amount in 1i128..=100_000_i128,
+        period in 1u64..=MAX_PERIOD,
+        elapsed_periods in 0u32..=(MAX_CATCHUP_PERIODS * 2),
+        elapsed_remainder in 0u64..=MAX_PERIOD,
+        max_periods in 0u32..=(MAX_CATCHUP_PERIODS * 2),
+    ) {
+        let elapsed_seconds = period * elapsed_periods as u64 + elapsed_remainder % period;
+        if elapsed_seconds == 0 {
+            return Ok(());
+        }
+
+        let mint_amount = amount * MAX_CATCHUP_PERIODS as i128;
+        let w = setup_world(mint_amount);
+        let id = w.subscribe(amount, period);
+        let elapsed_whole_periods = (elapsed_seconds / period) as u32;
+        w.env.ledger().set_timestamp(START + elapsed_seconds);
+        let token_client = StellarAssetClient::new(&w.env, &w.token);
+        let expected_periods = core::cmp::min(elapsed_whole_periods, max_periods);
+        let before = w.client().get_subscription(&id);
+
+        if max_periods > MAX_CATCHUP_PERIODS {
+            let result = w.client().try_charge_catchup(&id, &max_periods);
+            let err = result.unwrap_err().unwrap();
+            prop_assert_eq!(err, ForgeError::InvalidInput);
+            prop_assert_eq!(w.client().get_subscription(&id), before);
+            prop_assert_eq!(token_client.balance(&w.subscriber), mint_amount);
+            prop_assert_eq!(token_client.balance(&w.provider), 0);
+        } else {
+            let billed = w.client().charge_catchup(&id, &max_periods);
+            prop_assert!(expected_periods <= elapsed_whole_periods);
+            prop_assert!(expected_periods <= max_periods);
+            prop_assert!(expected_periods <= MAX_CATCHUP_PERIODS);
+            prop_assert_eq!(billed, amount * expected_periods as i128);
+
+            let after = w.client().get_subscription(&id);
+            prop_assert_eq!(
+                after.last_charged,
+                START + period * expected_periods as u64
+            );
+            prop_assert_eq!(token_client.balance(&w.subscriber), mint_amount - billed);
+            prop_assert_eq!(token_client.balance(&w.provider), billed);
+        }
+    }
+
+    #[test]
+    fn prop_pause_resume_conserves_due_date_and_never_charges_while_paused(
+        amount in 1i128..=100_000_i128,
+        period in 10_000u64..=MAX_PERIOD,
+        pause_duration in 1u64..=MAX_PERIOD,
+        between_cycles in 0u64..=100_u64,
+        cycles in 1u32..=10_u32,
+    ) {
+        let mint_amount = amount * (cycles as i128 + 1);
+        let w = setup_world(mint_amount);
+        let id = w.subscribe(amount, period);
+        let token_client = StellarAssetClient::new(&w.env, &w.token);
+        let mut now = START;
+        let mut expected_last_charged = START;
+
+        for _ in 0..cycles {
+            w.env.ledger().set_timestamp(now);
+            w.client().pause(&id);
+            let balance_before = token_client.balance(&w.subscriber);
+
+            now += pause_duration;
+            w.env.ledger().set_timestamp(now);
+            let result = w.client().try_charge(&id);
+            prop_assert!(result.is_err(), "charge must fail while paused");
+            prop_assert_eq!(result.unwrap_err().unwrap(), ForgeError::InvalidInput);
+            let paused = w.client().get_subscription(&id);
+            prop_assert_eq!(paused.status, SubscriptionStatus::Paused);
+            prop_assert_eq!(paused.last_charged, expected_last_charged);
+            prop_assert_eq!(token_client.balance(&w.subscriber), balance_before);
+
+            w.client().resume(&id);
+            expected_last_charged += pause_duration;
+            let resumed = w.client().get_subscription(&id);
+            prop_assert_eq!(resumed.status, SubscriptionStatus::Active);
+            prop_assert_eq!(resumed.last_charged, expected_last_charged);
+            now += between_cycles;
+        }
+
+        let next_due = expected_last_charged + period;
+        prop_assert!(now < next_due);
+        w.env.ledger().set_timestamp(now);
+        prop_assert_eq!(w.client().charge(&id), 0);
+        prop_assert_eq!(w.client().get_subscription(&id).last_charged, expected_last_charged);
+
+        w.env.ledger().set_timestamp(next_due);
+        prop_assert_eq!(w.client().charge(&id), amount);
+        prop_assert_eq!(w.client().get_subscription(&id).last_charged, next_due);
     }
 }

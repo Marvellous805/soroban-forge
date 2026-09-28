@@ -42,13 +42,23 @@
 //! Wallet entrypoints carry no token pulls inside the tested paths, so no
 //! nested sub-invocations appear in any tree (unlike the DAO's bond pull).
 
-use crate::{MultiSigWallet, SorobanForgeMultiSigWalletClient};
+use crate::{
+    LimitChange, MultiSigWallet, SorobanForgeMultiSigWalletClient, TxKind, TxStatus,
+    WithdrawalLimit,
+};
 use soroban_forge_test_utils::{MockTarget, TestAccounts};
 // The test harness links std even in a no_std crate; AuthorizedInvocation's
 // sub_invocations field is a std Vec, so re-expose std here for `vec!`.
 extern crate std;
-use soroban_sdk::testutils::{AuthorizedFunction, AuthorizedInvocation, MockAuth, MockAuthInvoke};
-use soroban_sdk::{Bytes, Env, IntoVal, InvokeError, Symbol};
+use soroban_sdk::testutils::{
+    Address as _, AuthorizedFunction, AuthorizedInvocation, MockAuth, MockAuthInvoke,
+};
+use soroban_sdk::token::StellarAssetClient;
+use soroban_sdk::{Address, Bytes, Env, IntoVal, InvokeError, Symbol};
+
+const DEPOSIT_AMOUNT: i128 = 1_000;
+const LIMIT_AMOUNT: i128 = 2_000;
+const WINDOW_SECONDS: u64 = 3_600;
 
 /// Fresh env with blanket mocking for *setup only*. The tested call re-arms
 /// the envelope afterwards.
@@ -77,6 +87,33 @@ fn owner_vec(env: &Env, accounts: &TestAccounts) -> soroban_sdk::Vec<soroban_sdk
         accounts.user2.clone(),
         accounts.user3.clone()
     ]
+}
+
+fn initialize_wallet(
+    env: &Env,
+    client: &SorobanForgeMultiSigWalletClient<'_>,
+    accounts: &TestAccounts,
+) {
+    client.initialize(&owner_vec(env, accounts), &2_u32);
+}
+
+fn funded_token(env: &Env, account: &Address, amount: i128) -> Address {
+    let admin = Address::generate(env);
+    let token = env.register_stellar_asset_contract_v2(admin).address();
+    StellarAssetClient::new(env, &token).mint(account, &amount);
+    token
+}
+
+fn install_withdrawal_limit(
+    client: &SorobanForgeMultiSigWalletClient<'_>,
+    accounts: &TestAccounts,
+    token: &Address,
+) -> u64 {
+    let tx_id = client.set_withdrawal_limit(&accounts.user1, token, &LIMIT_AMOUNT, &WINDOW_SECONDS);
+    client.confirm(&tx_id, &accounts.user2);
+    client.confirm(&tx_id, &accounts.user3);
+    client.execute(&tx_id);
+    tx_id
 }
 
 /// Assert that a `try_` call aborted on authorization (the host aborts the
@@ -449,4 +486,589 @@ fn execute_of_an_already_executed_tx_is_rejected() {
     // pinned deterministically; props.rs P2 covers it over random inputs).
     let err = client.try_execute(&tx_id).unwrap_err().unwrap();
     assert_eq!(err, soroban_forge_shared_utils::ForgeError::InvalidInput);
+}
+
+// -----------------------------------------------------------------------
+// reject — owner-only veto
+// -----------------------------------------------------------------------
+
+#[test]
+fn reject_accepts_owner_signature_below_threshold() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let target = env.register(MockTarget, ());
+    let tx_id = client.submit(&accounts.user1, &target, &payload(&env));
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user2,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "reject",
+            args: (tx_id, &accounts.user2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client
+        .try_reject(&tx_id, &accounts.user2)
+        .expect("outer ok")
+        .expect("contract ok");
+    let tx = client.get_tx(&tx_id);
+    assert_eq!(tx.rejections.len(), 1);
+    assert_eq!(tx.status, TxStatus::Pending);
+}
+
+#[test]
+fn reject_returns_unauthorized_for_non_owner() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let target = env.register(MockTarget, ());
+    let tx_id = client.submit(&accounts.user1, &target, &payload(&env));
+
+    let err = client
+        .try_reject(&tx_id, &accounts.deployer)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_forge_shared_utils::ForgeError::Unauthorized);
+    let tx = client.get_tx(&tx_id);
+    assert_eq!(tx.rejections.len(), 0);
+    assert_eq!(tx.status, TxStatus::Pending);
+}
+
+#[test]
+fn reject_rejects_signature_replayed_for_another_tx() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let target = env.register(MockTarget, ());
+    let first_tx = client.submit(&accounts.user1, &target, &payload(&env));
+    let second_tx = client.submit(&accounts.user1, &target, &payload(&env));
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user2,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "reject",
+            args: (first_tx, &accounts.user2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_reject(&second_tx, &accounts.user2));
+    assert_eq!(client.get_tx(&first_tx).rejections.len(), 0);
+    assert_eq!(client.get_tx(&second_tx).rejections.len(), 0);
+}
+
+#[test]
+fn reject_twice_by_same_owner_is_invalid() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let target = env.register(MockTarget, ());
+    let tx_id = client.submit(&accounts.user1, &target, &payload(&env));
+    client.reject(&tx_id, &accounts.user2);
+
+    let err = client
+        .try_reject(&tx_id, &accounts.user2)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_forge_shared_utils::ForgeError::InvalidInput);
+    assert_eq!(client.get_tx(&tx_id).rejections.len(), 1);
+}
+
+#[test]
+fn blank_envelope_aborts_reject_without_changing_tx() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let target = env.register(MockTarget, ());
+    let tx_id = client.submit(&accounts.user1, &target, &payload(&env));
+    env.set_auths(&[]);
+
+    assert_auth_abort!(client.try_reject(&tx_id, &accounts.user2));
+    let tx = client.get_tx(&tx_id);
+    assert_eq!(tx.rejections.len(), 0);
+    assert_eq!(tx.status, TxStatus::Pending);
+}
+
+// -----------------------------------------------------------------------
+// deposit — depositor-authorized custody pull
+// -----------------------------------------------------------------------
+
+#[test]
+fn deposit_accepts_from_signature_and_nested_token_authorization() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+
+    let transfer_sub_invokes = [MockAuthInvoke {
+        contract: &token,
+        fn_name: "transfer",
+        args: (&accounts.user1, &contract_id, DEPOSIT_AMOUNT).into_val(&env),
+        sub_invokes: &[],
+    }];
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "deposit",
+            args: (&token, &accounts.user1, DEPOSIT_AMOUNT).into_val(&env),
+            sub_invokes: &transfer_sub_invokes,
+        },
+    }]);
+
+    client
+        .try_deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert_eq!(client.balance(&token), DEPOSIT_AMOUNT);
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&accounts.user1),
+        0
+    );
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&contract_id),
+        DEPOSIT_AMOUNT
+    );
+}
+
+#[test]
+fn deposit_rejects_signature_from_a_different_party() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "deposit",
+            args: (&token, &accounts.user1, DEPOSIT_AMOUNT).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT));
+    assert_eq!(client.balance(&token), 0);
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&accounts.user1),
+        DEPOSIT_AMOUNT
+    );
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&contract_id),
+        0
+    );
+}
+
+#[test]
+fn blank_envelope_aborts_deposit_without_changing_custody_or_balances() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    env.set_auths(&[]);
+
+    assert_auth_abort!(client.try_deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT));
+    assert_eq!(client.balance(&token), 0);
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&accounts.user1),
+        DEPOSIT_AMOUNT
+    );
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(&contract_id),
+        0
+    );
+}
+
+#[test]
+fn deposit_authorization_tree_is_depositor_over_token_transfer() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+
+    assert_eq!(
+        env.auths(),
+        [(
+            accounts.user1.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract_id.clone(),
+                    Symbol::new(&env, "deposit"),
+                    (&token, &accounts.user1, DEPOSIT_AMOUNT).into_val(&env),
+                )),
+                sub_invocations: std::vec![AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        token.clone(),
+                        Symbol::new(&env, "transfer"),
+                        (&accounts.user1, &contract_id, DEPOSIT_AMOUNT).into_val(&env),
+                    )),
+                    sub_invocations: std::vec![],
+                }],
+            },
+        )],
+    );
+}
+
+// -----------------------------------------------------------------------
+// submit_withdrawal — owner-only and reserves window usage
+// -----------------------------------------------------------------------
+
+#[test]
+fn submit_withdrawal_accepts_owner_signature_and_records_usage() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+    install_withdrawal_limit(&client, &accounts, &token);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "submit_withdrawal",
+            args: (
+                &accounts.user1,
+                &token,
+                &accounts.arbiter,
+                DEPOSIT_AMOUNT / 2,
+            )
+                .into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let tx_id = client
+        .try_submit_withdrawal(
+            &accounts.user1,
+            &token,
+            &accounts.arbiter,
+            &(DEPOSIT_AMOUNT / 2),
+        )
+        .expect("outer ok")
+        .expect("contract ok");
+    assert_eq!(client.get_tx(&tx_id).submitter, accounts.user1);
+    assert_eq!(client.get_tx_count(), 2);
+    assert_eq!(client.get_window_usage(&token), DEPOSIT_AMOUNT / 2);
+}
+
+#[test]
+fn submit_withdrawal_rejects_wrong_owner_signature() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "submit_withdrawal",
+            args: (
+                &accounts.user1,
+                &token,
+                &accounts.arbiter,
+                DEPOSIT_AMOUNT / 2,
+            )
+                .into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_submit_withdrawal(
+        &accounts.user1,
+        &token,
+        &accounts.arbiter,
+        &(DEPOSIT_AMOUNT / 2)
+    ));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert_eq!(client.get_window_usage(&token), 0);
+    assert_eq!(client.balance(&token), DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn submit_withdrawal_rejects_signature_replayed_with_different_amount() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "submit_withdrawal",
+            args: (&accounts.user1, &token, &accounts.arbiter, 400_i128).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_submit_withdrawal(
+        &accounts.user1,
+        &token,
+        &accounts.arbiter,
+        &500_i128
+    ));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert_eq!(client.get_window_usage(&token), 0);
+}
+
+#[test]
+fn blank_envelope_aborts_submit_withdrawal_without_reserving_usage() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+    env.set_auths(&[]);
+
+    assert_auth_abort!(client.try_submit_withdrawal(
+        &accounts.user1,
+        &token,
+        &accounts.arbiter,
+        &(DEPOSIT_AMOUNT / 2)
+    ));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert_eq!(client.get_window_usage(&token), 0);
+    assert_eq!(client.balance(&token), DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn submit_withdrawal_authorization_tree_is_the_owner_entrypoint_frame() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = funded_token(&env, &accounts.user1, DEPOSIT_AMOUNT);
+    client.deposit(&token, &accounts.user1, &DEPOSIT_AMOUNT);
+    install_withdrawal_limit(&client, &accounts, &token);
+
+    client.submit_withdrawal(
+        &accounts.user1,
+        &token,
+        &accounts.arbiter,
+        &(DEPOSIT_AMOUNT / 2),
+    );
+
+    assert_eq!(
+        env.auths(),
+        [(
+            accounts.user1.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract_id.clone(),
+                    Symbol::new(&env, "submit_withdrawal"),
+                    (
+                        &accounts.user1,
+                        &token,
+                        &accounts.arbiter,
+                        DEPOSIT_AMOUNT / 2,
+                    )
+                        .into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            },
+        )],
+    );
+}
+
+// -----------------------------------------------------------------------
+// set_withdrawal_limit / remove_withdrawal_limit — owner-only policy txs
+// -----------------------------------------------------------------------
+
+#[test]
+fn set_withdrawal_limit_accepts_owner_signature() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_withdrawal_limit",
+            args: (&accounts.user1, &token, LIMIT_AMOUNT, WINDOW_SECONDS).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let tx_id = client
+        .try_set_withdrawal_limit(&accounts.user1, &token, &LIMIT_AMOUNT, &WINDOW_SECONDS)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert_eq!(client.get_tx(&tx_id).submitter, accounts.user1);
+    assert_eq!(client.get_tx_count(), 1);
+    assert_eq!(
+        client.get_tx(&tx_id).kind,
+        TxKind::LimitChange(LimitChange::Set(WithdrawalLimit {
+            token: token.clone(),
+            amount: LIMIT_AMOUNT,
+            window_seconds: WINDOW_SECONDS,
+        }))
+    );
+    assert_eq!(client.get_withdrawal_limit(&token), None);
+}
+
+#[test]
+fn set_withdrawal_limit_rejects_wrong_owner_signature() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_withdrawal_limit",
+            args: (&accounts.user1, &token, LIMIT_AMOUNT, WINDOW_SECONDS).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_set_withdrawal_limit(
+        &accounts.user1,
+        &token,
+        &LIMIT_AMOUNT,
+        &WINDOW_SECONDS
+    ));
+    assert_eq!(client.get_tx_count(), 0);
+    assert_eq!(client.get_withdrawal_limit(&token), None);
+}
+
+#[test]
+fn set_withdrawal_limit_rejects_replay_with_different_parameters() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_withdrawal_limit",
+            args: (&accounts.user1, &token, 1_000_i128, 3_600_u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_set_withdrawal_limit(
+        &accounts.user1,
+        &token,
+        &1_500_i128,
+        &7_200_u64
+    ));
+    assert_eq!(client.get_tx_count(), 0);
+    assert_eq!(client.get_withdrawal_limit(&token), None);
+}
+
+#[test]
+fn blank_envelope_aborts_set_withdrawal_limit_without_writing_tx() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+    env.set_auths(&[]);
+
+    assert_auth_abort!(client.try_set_withdrawal_limit(
+        &accounts.user1,
+        &token,
+        &LIMIT_AMOUNT,
+        &WINDOW_SECONDS
+    ));
+    assert_eq!(client.get_tx_count(), 0);
+    assert_eq!(client.get_withdrawal_limit(&token), None);
+}
+
+#[test]
+fn remove_withdrawal_limit_accepts_owner_signature() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let active_limit = client.get_withdrawal_limit(&token);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "remove_withdrawal_limit",
+            args: (&accounts.user1, &token).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let tx_id = client
+        .try_remove_withdrawal_limit(&accounts.user1, &token)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert_eq!(client.get_tx(&tx_id).submitter, accounts.user1);
+    assert_eq!(client.get_tx_count(), 2);
+    assert_eq!(
+        client.get_tx(&tx_id).kind,
+        TxKind::LimitChange(LimitChange::Remove(token.clone()))
+    );
+    assert_eq!(client.get_withdrawal_limit(&token), active_limit);
+}
+
+#[test]
+fn remove_withdrawal_limit_rejects_wrong_owner_signature() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+    let active_limit = client.get_withdrawal_limit(&token);
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "remove_withdrawal_limit",
+            args: (&accounts.user1, &token).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_remove_withdrawal_limit(&accounts.user1, &token));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert_eq!(client.get_withdrawal_limit(&token), active_limit);
+}
+
+#[test]
+fn remove_withdrawal_limit_rejects_signature_replayed_for_another_token() {
+    let (env, contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+    let other_token = Address::generate(&env);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+
+    env.mock_auths(&[MockAuth {
+        address: &accounts.user1,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "remove_withdrawal_limit",
+            args: (&accounts.user1, &token).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_remove_withdrawal_limit(&accounts.user1, &other_token));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert!(client.get_withdrawal_limit(&token).is_some());
+    assert_eq!(client.get_withdrawal_limit(&other_token), None);
+}
+
+#[test]
+fn blank_envelope_aborts_remove_withdrawal_limit_without_writing_tx() {
+    let (env, _contract_id, client, accounts) = setup!();
+    initialize_wallet(&env, &client, &accounts);
+    let token = Address::generate(&env);
+    install_withdrawal_limit(&client, &accounts, &token);
+    let count_before = client.get_tx_count();
+    let active_limit = client.get_withdrawal_limit(&token);
+    env.set_auths(&[]);
+
+    assert_auth_abort!(client.try_remove_withdrawal_limit(&accounts.user1, &token));
+    assert_eq!(client.get_tx_count(), count_before);
+    assert_eq!(client.get_withdrawal_limit(&token), active_limit);
 }

@@ -121,6 +121,15 @@
 //! entry's TTL with the standard threshold/extend-to pattern, and
 //! `touch_ttl` is a permissionless keeper entrypoint for escrows that sit
 //! idle near expiry.
+//!
+//! The participant index contains every non-cancelled escrow for each
+//! distinct buyer, seller, or arbiter. A successful `cancel` removes its id
+//! from each distinct party's list after state and authorization checks,
+//! preserving survivor order. Other terminal paths (`release`, `refund`,
+//! and `resolve`) retain their ids because those escrow records remain
+//! addressable. Pagination is live offset/limit, not a frozen snapshot:
+//! removing an earlier id shifts later ids left, so a saved cursor can skip
+//! an id. Clients should restart from cursor zero after mutation.
 
 // WASM target guard: SDK 27 contracts must be built for wasm32v1-none.
 // wasm32-unknown-unknown (os=unknown) can emit features the Soroban
@@ -269,7 +278,8 @@ pub trait SorobanForgeEscrow {
     ///   the payout.
     fn resolve(env: Env, escrow_id: u64, in_favor_of_seller: bool) -> Result<(), ForgeError>;
 
-    /// Cancel a `Pending` escrow before it is funded. Requires the buyer.
+    /// Cancel a `Pending` escrow before it is funded. Requires the buyer and
+    /// removes its id from each distinct party's participant index.
     ///
     /// # Errors
     ///
@@ -292,22 +302,23 @@ pub trait SorobanForgeEscrow {
     /// * [`ForgeError::NotFound`] — no escrow with this id.
     fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowData, ForgeError>;
 
-    /// List the escrow ids a participant is party to (buyer, seller, or
-    /// arbiter), in creation order.
+    /// List the non-cancelled escrow ids a participant is party to (buyer,
+    /// seller, or arbiter), in creation order. Other terminal escrows remain
+    /// listed because their records remain addressable.
     ///
     /// Read-only: requires no authorization and never mutates storage. An
     /// address with no escrows — or an address this contract has never seen
     /// — returns an empty page, not an error. Good for building "my
     /// escrows" views without an off-chain indexer.
     ///
-    /// Pagination is a simple offset/limit scheme. `cursor` is the offset
-    /// of the first id to return and `limit` caps the page size. The
-    /// returned [`ParticipantEscrowsPage::next_cursor`] continues the next
-    /// page; `None` means the list is exhausted. A `limit` of `0` returns
-    /// an empty page with no next cursor.
-    ///
-    /// Iterating by replaying `next_cursor` until it is `None` yields every
-    /// escrow involving the participant exactly once, in creation order.
+    /// Pagination is a live offset/limit scheme. `cursor` is the offset in
+    /// the current index when this call runs and `limit` caps the page size.
+    /// The returned [`ParticipantEscrowsPage::next_cursor`] continues from
+    /// that offset; `None` means the current list is exhausted. A `limit` of
+    /// `0` returns an empty page with no next cursor. If cancellation removes
+    /// an id before a saved cursor, later ids shift left and that cursor may
+    /// skip an id. Restart at cursor `0` after any index mutation to enumerate
+    /// the current list without omissions.
     ///
     /// # Errors
     ///
@@ -487,8 +498,9 @@ pub enum DataKey {
     Escrow(u64),
     /// Monotonic id counter.
     Count,
-    /// Creation-order ids of every escrow the `Address` participates in
-    /// (as buyer, seller, or arbiter), written once per escrow creation.
+    /// Creation-order ids of every non-cancelled escrow the `Address`
+    /// participates in (as buyer, seller, or arbiter). Written at creation
+    /// and removed only when a pending escrow is cancelled.
     ///
     /// Persistent, not instance: the entry grows with that party's escrow
     /// count and is written only on the create path, so parking it in
@@ -801,6 +813,9 @@ impl Escrow {
             .persistent()
             .set(&DataKey::Escrow(escrow_id), &cancelled);
         bump_entry(&env, &DataKey::Escrow(escrow_id));
+        // All fallible checks, including buyer auth, are complete. Remove the
+        // id from each distinct participant index on the success path.
+        Self::remove_participant_indexes(&env, escrow_id, &cancelled);
         events::cancelled(&env, &cancelled);
         Ok(())
     }
@@ -822,9 +837,13 @@ impl Escrow {
         Self::load_escrow(&env, escrow_id)
     }
 
-    /// Read the creation-order escrow ids one page at a time for a
-    /// participant. Read-only: never mutates storage and never errors — an
-    /// unknown address or one with no escrows simply yields an empty page.
+    /// Read the current creation-order escrow ids for a participant one page
+    /// at a time. Cancellation removes ids from the compacted index. A cursor
+    /// is an offset into the current list; if an earlier id is removed between
+    /// pages, later ids may shift before the cursor. Restart at zero after
+    /// mutations to enumerate the current list completely. This view itself
+    /// never mutates storage and never errors — an unknown address or one with
+    /// no escrows simply yields an empty page.
     pub fn escrows_for_participant(
         env: Env,
         participant: Address,
@@ -937,6 +956,39 @@ impl Escrow {
                 .unwrap_or_else(|| Vec::new(env));
             ids.push_back(id);
             env.storage().persistent().set(&key, &ids);
+            bump_entry(env, &key);
+        }
+    }
+
+    /// Remove `id` from each distinct participant's index while preserving
+    /// the relative creation order of every remaining id.
+    fn remove_participant_indexes(env: &Env, id: u64, escrow: &EscrowData) {
+        Self::remove_index(env, &escrow.buyer, id);
+        if escrow.seller != escrow.buyer {
+            Self::remove_index(env, &escrow.seller, id);
+        }
+        if escrow.arbiter != escrow.buyer && escrow.arbiter != escrow.seller {
+            Self::remove_index(env, &escrow.arbiter, id);
+        }
+    }
+
+    /// Remove one id from a participant's index without reordering survivors.
+    fn remove_index(env: &Env, participant: &Address, id: u64) {
+        let key = DataKey::ParticipantIndex(participant.clone());
+        let Some(ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) else {
+            return;
+        };
+        let mut remaining = Vec::new(env);
+        let mut removed = false;
+        for indexed_id in ids.iter() {
+            if indexed_id == id {
+                removed = true;
+            } else {
+                remaining.push_back(indexed_id);
+            }
+        }
+        if removed {
+            env.storage().persistent().set(&key, &remaining);
             bump_entry(env, &key);
         }
     }

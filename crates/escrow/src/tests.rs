@@ -398,10 +398,68 @@ fn cancel_pending_escrow() {
     let (_env, token, _tc, _id, client, accounts) = setup!();
     let (buyer, seller, arbiter) = parties(&accounts);
     let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let second = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
 
     client.cancel(&id);
 
     assert_eq!(client.get_status(&id), EscrowStatus::Cancelled);
+    for party in [buyer, seller, arbiter] {
+        assert_full_index(&client, party, &[second]);
+    }
+}
+
+#[test]
+fn cancel_removes_shared_role_index_once_and_double_cancel_is_noop() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, _seller, _arbiter) = parties(&accounts);
+    let shared = &accounts.user3;
+    let id = create(&client, &token, buyer, shared, shared, TIMEOUT);
+    let other = create(&client, &token, buyer, shared, shared, TIMEOUT);
+
+    client.cancel(&id);
+    assert_full_index(&client, buyer, &[other]);
+    assert_full_index(&client, shared, &[other]);
+
+    let err = client.try_cancel(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_full_index(&client, buyer, &[other]);
+    assert_full_index(&client, shared, &[other]);
+}
+
+#[test]
+fn failed_cancel_keeps_all_participant_indexes_unchanged() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    let err = client.try_cancel(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    for party in [buyer, seller, arbiter] {
+        assert_full_index(&client, party, &[id]);
+    }
+}
+
+#[test]
+fn other_terminal_transitions_keep_participant_index_entries() {
+    let (env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    StellarAssetClient::new(&env, &token).mint(buyer, &(AMOUNT * 2));
+
+    let released = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let refunded = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let resolved = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&released);
+    client.release(&released);
+    client.deposit(&refunded);
+    client.refund(&refunded);
+    client.deposit(&resolved);
+    client.dispute(&resolved, buyer);
+    client.resolve(&resolved, &false);
+
+    for party in [buyer, seller, arbiter] {
+        assert_full_index(&client, party, &[released, refunded, resolved]);
+    }
 }
 
 #[test]
@@ -565,6 +623,43 @@ fn pagination_returns_sliced_pages_with_cursors() {
     assert_eq!(page.total, 10);
     assert_eq!(page.ids.len(), 0);
     assert_eq!(page.next_cursor, None);
+
+    let page = client.escrows_for_participant(buyer, &u32::MAX, &u32::MAX);
+    assert_eq!(page.total, 10);
+    assert_eq!(page.ids.len(), 0);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn pagination_cursor_is_live_offset_and_can_skip_after_earlier_cancel() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let ids = [
+        create(&client, &token, buyer, seller, arbiter, TIMEOUT),
+        create(&client, &token, buyer, seller, arbiter, TIMEOUT),
+        create(&client, &token, buyer, seller, arbiter, TIMEOUT),
+        create(&client, &token, buyer, seller, arbiter, TIMEOUT),
+        create(&client, &token, buyer, seller, arbiter, TIMEOUT),
+    ];
+
+    let first = client.escrows_for_participant(buyer, &0, &2);
+    assert_eq!(first.ids.get_unchecked(0), ids[0]);
+    assert_eq!(first.ids.get_unchecked(1), ids[1]);
+    assert_eq!(first.next_cursor, Some(2));
+
+    client.cancel(&ids[0]);
+    let continued = client.escrows_for_participant(buyer, &2, &2);
+    assert_eq!(continued.ids.get_unchecked(0), ids[3]);
+    assert_eq!(continued.ids.get_unchecked(1), ids[4]);
+
+    // The saved live offset skipped ids[2]; restarting sees every surviving
+    // id in creation order without duplicates.
+    let restarted = client.escrows_for_participant(buyer, &0, &u32::MAX);
+    assert_eq!(restarted.ids.len(), 4);
+    assert_eq!(restarted.ids.get_unchecked(0), ids[1]);
+    assert_eq!(restarted.ids.get_unchecked(1), ids[2]);
+    assert_eq!(restarted.ids.get_unchecked(2), ids[3]);
+    assert_eq!(restarted.ids.get_unchecked(3), ids[4]);
 }
 
 #[test]
