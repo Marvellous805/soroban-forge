@@ -5,7 +5,8 @@
 //! Recurring, on-chain subscription billing: a subscriber authorises a
 //! provider to pull a fixed `amount` per `period` (seconds) from a token
 //! balance using SEP-41 tokens. The contract tracks subscription state,
-//! billing cadence, token settlement, pause/resume, and arrears retry handling.
+//! billing cadence, token settlement, pause/resume, arrears retry handling,
+//! and metered usage (per-metric quotas with exact overage pricing).
 //!
 //! Lifecycle:
 //!
@@ -34,6 +35,11 @@
 //!   elapsed periods, bounded by [`MAX_CATCHUP_PERIODS`]. It refuses
 //!   `PastDue` subscriptions so arrears retry semantics remain owned by
 //!   `charge`.
+//! - `set_quotas` requires the subscriber: quotas price the overage the
+//!   subscriber is billed, so the account being charged is the one that
+//!   consents to the terms.
+//! - `record_usage` requires the provider (the party that served the usage
+//!   and meters it, mirroring who is authorized to `charge`).
 //! - `pause` requires the subscriber.
 //! - `resume` requires the subscriber.
 //! - `cancel` requires the subscriber (works from `Active`, `Paused`, or `PastDue`).
@@ -48,6 +54,8 @@
 //! | `revoke_provider`          | subscriber                         |
 //! | `subscribe_on_behalf_of`   | provider + valid subscriber opt-in |
 //! | `charge`                   | provider (existing authorization)  |
+//! | `set_quotas`               | subscriber (prices the overage)    |
+//! | `record_usage`             | provider (meters the service)      |
 //! | `pause`                    | subscriber                         |
 //! | `resume`                   | subscriber                         |
 //! | `cancel`                   | subscriber                         |
@@ -74,13 +82,77 @@
 //! [`Subscription`] shape with the same sequential id counter, so
 //! [`get_subscription`] cannot distinguish a subscriber-created from a
 //! provider-created record, and no consent-origin field is needed.
+//!
+//! ## Metered usage: quotas and overage
+//!
+//! A flat `amount` per period is a one-size-fits-all price. Production
+//! products also price *usage*: a base period fee plus included units per
+//! metric, with a per-bucket overage price for what exceeds the inclusion
+//! (for example "10k API calls included, then 5 stroops per 1k over").
+//!
+//! - A subscription carries a declared quota list, [`Vec<MetricQuota>`]. An
+//!   **empty list is the flat flow**: [`period_amount`] short-circuits to
+//!   `amount`, the charged value and every event payload are bit-identical to
+//!   a contract without this feature, and the existing regression suite is
+//!   unchanged.
+//! - The provider meters usage with `record_usage(subscription_id, metric,
+//!   units)`, which accumulates **raw units** for the open period only, under
+//!   [`DataKey::Usage`]. Recording is rejected for a metric the subscription
+//!   does not declare, so a provider can never meter usage the subscriber has
+//!   not already been asked to pay for.
+//! - The amount a period bills is derived in one place — the pure
+//!   [`period_amount`] helper, called by `charge`, by every period of
+//!   `charge_catchup`, and by the `quote_period` view:
+//!
+//!   ```text
+//!   amount = base
+//!          + Σ over metric of ceil(min(max(0, units - included), cap) / bucket) * overage_price
+//!   ```
+//!
+//!   with `cap` omitted for an uncapped quota. A started bucket is billed in
+//!   full and the price is **per bucket**, never per unit, so no sub-unit
+//!   price precision is ever lost.
+//! - **No rounding drift is possible across periods.** The accumulator holds
+//!   raw units and never a bucket count or a carried-over remainder, so each
+//!   period's amount is a pure function of that period's units. Charging `N`
+//!   periods bills exactly `N` times the per-period derivation — there is no
+//!   state in which rounding can compound.
+//! - Meters are dropped atomically with the charge that closes the period, in
+//!   the same frame that advances `last_charged`. A **failed** transfer
+//!   returns before that point, so every meter survives untouched and the
+//!   retry re-derives a byte-identical amount.
+//! - `charge_catchup` settles the open period **last**: usage can only be
+//!   metered into the open (latest) period, so earlier unsettled periods bill
+//!   the base amount and only the final one carries overage.
+//! - `record_usage` requires an `Active` subscription, which is what freezes
+//!   the meter at the attempted amount once a charge has failed and makes the
+//!   arrears retry identical to the attempt that failed.
+//!
+//! ### Design decisions
+//!
+//! 1. **Cap policy** — a per-metric `max_overage_units` on *billable overage
+//!    units*, enforced at settlement by clamping, never by rejecting. A charge
+//!    is always billable, so a usage spike cannot wedge a subscription, and
+//!    the subscriber's worst case per period is `base + Σ caps`. Rejecting at
+//!    `record_usage` time was rejected because refused units would spill into
+//!    the next period and break the "current period only" property.
+//! 2. **Bucketing / rounding** — integer buckets priced per bucket, rounded
+//!    **up** (a started bucket is charged in full), derived from raw units on
+//!    every derivation. A cap that is not a multiple of `bucket_units` bills
+//!    at most `ceil(cap / bucket_units)` buckets.
+//! 3. **Accumulator storage class** — instance storage
+//!    ([`DataKey::Usage`]), one entry per `(subscription, metric)`, stamped
+//!    with the `last_charged` it belongs to. Instance storage matches the
+//!    rest of the crate; the persistent-storage migration with TTL maintenance
+//!    is tracked separately and does not change the rollover rules.
 
 #[cfg(test)]
 extern crate std;
 
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env,
+    Symbol, Vec,
 };
 
 /// Maximum consecutive failed payment attempts before transitioning to Cancelled.
@@ -92,6 +164,13 @@ const MAX_RETRIES: u32 = 3;
 /// covering practical keeper downtime without requiring one transaction per
 /// missed period.
 const MAX_CATCHUP_PERIODS: u32 = 32;
+
+/// Maximum number of per-metric quotas one subscription may declare.
+///
+/// Every charge derives its amount by walking the quota list, so the list is
+/// bounded to keep that derivation — and the instance storage a metered
+/// subscription uses — inside Soroban's instruction and state budgets.
+const MAX_QUOTAS: u32 = 16;
 
 /// Public interface for the Soroban Forge subscription payments contract.
 #[contractclient(name = "SorobanForgeSubscriptionPaymentsClient")]
@@ -178,13 +257,83 @@ pub trait SorobanForgeSubscriptionPayments {
     ///
     /// Returns the total billed amount. `max_periods` must not exceed the
     /// contract's hard catch-up bound. A transfer failure returns
-    /// [`ForgeError::TokenTransferFailed`] and rolls back all transfers and
-    /// subscription state. `PastDue` subscriptions must use `charge` to
-    /// preserve the existing retry policy.
+    /// [`ForgeError::TokenTransferFailed`] and rolls back all transfers,
+    /// subscription state, and usage meters. `PastDue` subscriptions must use
+    /// `charge` to preserve the existing retry policy.
     fn charge_catchup(
         env: Env,
         subscription_id: u64,
         max_periods: u32,
+    ) -> Result<i128, soroban_forge_shared_utils::ForgeError>;
+
+    /// Declare (or replace) the metered-usage quotas of `subscription_id`.
+    ///
+    /// Requires the subscriber: a quota prices the overage the subscriber is
+    /// billed, so the account that is charged is the one that consents to the
+    /// terms. An empty list returns the subscription to flat pricing.
+    ///
+    /// Only valid while `Active` and only while the open period has no
+    /// recorded usage, so already-metered units can never be repriced
+    /// mid-period. Validated before authorization: at most [`MAX_QUOTAS`]
+    /// quotas, no duplicate metrics, `bucket_units > 0`, and
+    /// `overage_price >= 0`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::InvalidInput`] — the subscription is not `Active`, the
+    ///   open period already has recorded usage, or a quota failed validation.
+    /// * [`ForgeError::Unauthorized`] — the caller is not the subscriber.
+    /// * [`ForgeError::NotFound`] — no such subscription.
+    fn set_quotas(
+        env: Env,
+        subscription_id: u64,
+        quotas: soroban_sdk::Vec<MetricQuota>,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Record `units` of `metric` consumed in the subscription's open period.
+    ///
+    /// Requires the provider (the party that served the usage, mirroring who
+    /// is authorized to `charge`). Accumulates into the open period's raw unit
+    /// counter; the meters are dropped atomically by the charge that closes
+    /// the period.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no such subscription.
+    /// * [`ForgeError::InvalidInput`] — `units` is zero, the subscription is
+    ///   not `Active`, or the subscription does not declare `metric`.
+    /// * [`ForgeError::Unauthorized`] — the caller is not the provider.
+    /// * [`ForgeError::ArithmeticOverflow`] — the period's unit counter would
+    ///   overflow `u64`.
+    fn record_usage(
+        env: Env,
+        subscription_id: u64,
+        metric: soroban_sdk::Symbol,
+        units: u64,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Read the usage recorded for `metric` in the open period (read-only
+    /// view; requires no authorization).
+    ///
+    /// A metric with no recorded usage reads back as a zeroed record stamped
+    /// with the current `last_charged`, so callers can poll one metric without
+    /// branching on "never used".
+    fn get_usage(
+        env: Env,
+        subscription_id: u64,
+        metric: soroban_sdk::Symbol,
+    ) -> Result<UsageRecord, soroban_forge_shared_utils::ForgeError>;
+
+    /// The amount the open period would bill right now: `amount` plus the
+    /// overage for every declared metric (read-only view; requires no
+    /// authorization).
+    ///
+    /// This is the same derivation `charge` and `charge_catchup` settle, so a
+    /// quote and the resulting charge cannot disagree. For a flat subscription
+    /// it is exactly `amount`.
+    fn quote_period(
+        env: Env,
+        subscription_id: u64,
     ) -> Result<i128, soroban_forge_shared_utils::ForgeError>;
 
     /// Pause an active subscription, preventing further charges while paused.
@@ -269,7 +418,7 @@ pub struct Subscription {
     pub provider: Address,
     /// Token contract used for settlement.
     pub token: Address,
-    /// Amount charged per period.
+    /// Amount charged per period, before usage overage.
     pub amount: i128,
     /// Length of one billing period, in seconds.
     pub period: u64,
@@ -281,6 +430,54 @@ pub struct Subscription {
     pub paused_at: Option<u64>,
     /// Number of consecutive failed billing attempts.
     pub failed_attempts: u32,
+    /// Per-metric usage quotas priced on top of `amount`.
+    ///
+    /// Empty is the flat flow: the period bills exactly `amount`. The list is
+    /// shaped so it can be embedded verbatim in a plan record (a plan copies
+    /// its quotas here when a subscriber joins it), keeping the metering core
+    /// independent of where the terms were published.
+    pub quotas: Vec<MetricQuota>,
+}
+
+/// One metered dimension's pricing terms: units included in the base period
+/// price plus the per-bucket overage price for what exceeds the inclusion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricQuota {
+    /// The metered dimension, e.g. `api_calls` or `storage_bytes`.
+    pub metric: Symbol,
+    /// Units covered by the base `amount`; usage up to and including this
+    /// many units bills nothing extra.
+    pub included_units: u64,
+    /// Price of one started bucket of overage units, in the subscription's
+    /// token. Per bucket, never per unit, so no sub-unit price precision is
+    /// lost to integer division.
+    pub overage_price: i128,
+    /// Units per overage bucket. Must be greater than zero; a started bucket
+    /// is billed in full (rounding is up).
+    pub bucket_units: u64,
+    /// Cap on billable overage units for one period, or `None` for uncapped.
+    ///
+    /// The cap clamps overage units before they are bucketed, so a period can
+    /// bill at most `ceil(cap / bucket_units)` buckets for this metric.
+    pub max_overage_units: Option<u64>,
+}
+
+/// Usage metered for one metric in one billing period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageRecord {
+    /// Subscription the usage was recorded against.
+    pub subscription_id: u64,
+    /// The metered dimension.
+    pub metric: Symbol,
+    /// Raw units accumulated in the open period. Always a unit count, never a
+    /// bucket count, so no rounding state can survive into the next period.
+    pub units: u64,
+    /// The `last_charged` this meter belongs to. A meter whose stamp no
+    /// longer matches the subscription's open period is not counted, and the
+    /// next `record_usage` restarts it.
+    pub period_start: u64,
 }
 
 /// Instance-storage keys.
@@ -300,6 +497,10 @@ enum DataKey {
     /// `(subscriber, provider)`. Written by `authorize_provider`, removed by
     /// `revoke_provider`, consulted by `subscribe_on_behalf_of`.
     ProviderOptIn(Address, Address),
+    /// The open period's unit counter for `(subscription, metric)`. Written by
+    /// `record_usage`, removed by the charge that closes the period, read by
+    /// the amount derivation.
+    Usage(u64, Symbol),
 }
 
 /// The deployable subscription payments contract.
@@ -418,13 +619,22 @@ impl SubscriptionPayments {
     ///
     /// Requires the provider. If a full period has not elapsed since the last
     /// charge, returns `0` and leaves the subscription untouched. Otherwise
-    /// attempts to transfer `amount` of `token` from `subscriber` to `provider`.
+    /// attempts to transfer the period's derived amount of `token` from
+    /// `subscriber` to `provider`.
     ///
-    /// - On successful payment: advances `last_charged` by one period, resets
-    ///   `failed_attempts` to 0, transitions status to `Active`, and returns `amount`.
-    /// - On failed payment: `last_charged` is NOT advanced. Increments `failed_attempts`.
-    ///   If `failed_attempts >= MAX_RETRIES` (3), status becomes `Cancelled`.
-    ///   Otherwise status becomes `PastDue`. Returns `0`.
+    /// The derived amount is `amount` plus the overage for every declared
+    /// metric (see the module docs on metered usage) — exactly `amount` when no
+    /// quotas are declared. It is computed before the transfer, so an
+    /// arithmetic failure never moves funds.
+    ///
+    /// - On successful payment: advances `last_charged` by one period, drops
+    ///   the period's usage meters, resets `failed_attempts` to 0, transitions
+    ///   status to `Active`, and returns the derived amount.
+    /// - On failed payment: `last_charged` is NOT advanced and the usage
+    ///   meters are NOT dropped, so the retry re-derives the same amount.
+    ///   Increments `failed_attempts`. If `failed_attempts >= MAX_RETRIES`
+    ///   (3), status becomes `Cancelled`. Otherwise status becomes `PastDue`.
+    ///   Returns `0`.
     pub fn charge(env: Env, subscription_id: u64) -> Result<i128, ForgeError> {
         let mut subscription = Self::get_subscription_impl(&env, subscription_id)?;
         if subscription.status == SubscriptionStatus::Cancelled
@@ -442,11 +652,15 @@ impl SubscriptionPayments {
             return Ok(0);
         }
 
+        // Derived before the transfer: a usage or arithmetic failure leaves
+        // the subscription untouched and no funds in flight.
+        let amount = Self::derive_period_amount(&env, &subscription)?;
+
         // Execute SEP-41 token transfer from subscriber to provider
         let transfer_result = token::TokenClient::new(&env, &subscription.token).try_transfer(
             &subscription.subscriber,
             &subscription.provider,
-            &subscription.amount,
+            &amount,
         );
 
         match transfer_result {
@@ -455,11 +669,14 @@ impl SubscriptionPayments {
                 subscription.failed_attempts = 0;
                 subscription.status = SubscriptionStatus::Active;
                 subscription.paused_at = None;
+                // Period rollover: the meters go in the same frame that closes
+                // the period, so the next period starts from zero units.
+                Self::rollover_usage(&env, &subscription);
                 env.storage()
                     .instance()
                     .set(&DataKey::Subscription(subscription_id), &subscription);
-                events::charged(&env, &subscription);
-                Ok(subscription.amount)
+                events::charged(&env, &subscription, amount);
+                Ok(amount)
             }
             _ => {
                 let failed = subscription.failed_attempts.saturating_add(1);
@@ -510,19 +727,25 @@ impl SubscriptionPayments {
                 .last_charged
                 .checked_add(subscription.period)
                 .ok_or(ForgeError::ArithmeticOverflow)?;
+            // Usage can only be metered into the open (latest) period, and the
+            // meters are dropped as each period closes, so the first iteration
+            // is the only one that can carry overage: every period that follows
+            // derives the base amount. Same helper, same arithmetic, per period.
+            let amount = Self::derive_period_amount(&env, &subscription)?;
             let transfer_result = token::TokenClient::new(&env, &subscription.token).try_transfer(
                 &subscription.subscriber,
                 &subscription.provider,
-                &subscription.amount,
+                &amount,
             );
             if !matches!(transfer_result, Ok(Ok(()))) {
                 return Err(ForgeError::TokenTransferFailed);
             }
             total = total
-                .checked_add(subscription.amount)
+                .checked_add(amount)
                 .ok_or(ForgeError::ArithmeticOverflow)?;
             subscription.last_charged = next_due;
-            events::charged(&env, &subscription);
+            Self::rollover_usage(&env, &subscription);
+            events::charged(&env, &subscription, amount);
         }
 
         if periods > 0 {
@@ -534,6 +757,103 @@ impl SubscriptionPayments {
                 .set(&DataKey::Subscription(subscription_id), &subscription);
         }
         Ok(total)
+    }
+
+    /// Declare (or replace) the metered-usage quotas of `subscription_id`.
+    ///
+    /// Requires the subscriber — see the module docs on metered usage for why
+    /// the account being charged consents to the overage price. Rejected unless
+    /// the subscription is `Active` and the open period has no recorded usage,
+    /// so already-metered units can never be repriced mid-period.
+    pub fn set_quotas(
+        env: Env,
+        subscription_id: u64,
+        quotas: Vec<MetricQuota>,
+    ) -> Result<(), ForgeError> {
+        validate_quotas(&quotas)?;
+        let mut subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        if subscription.status != SubscriptionStatus::Active {
+            return Err(ForgeError::InvalidInput);
+        }
+        if Self::has_recorded_usage(&env, &subscription) {
+            return Err(ForgeError::InvalidInput);
+        }
+        subscription.subscriber.require_auth();
+
+        subscription.quotas = quotas;
+        env.storage()
+            .instance()
+            .set(&DataKey::Subscription(subscription_id), &subscription);
+        events::quotas_set(&env, &subscription);
+        Ok(())
+    }
+
+    /// Record `units` of `metric` consumed in the subscription's open period.
+    ///
+    /// Requires the provider. See the module docs on metered usage for the
+    /// period-boundary, cap, and retry semantics.
+    pub fn record_usage(
+        env: Env,
+        subscription_id: u64,
+        metric: Symbol,
+        units: u64,
+    ) -> Result<(), ForgeError> {
+        if units == 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        let subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        if subscription.status != SubscriptionStatus::Active {
+            return Err(ForgeError::InvalidInput);
+        }
+        if !declares_metric(&subscription, &metric) {
+            return Err(ForgeError::InvalidInput);
+        }
+        subscription.provider.require_auth();
+
+        // A meter belongs to the open period only. `charge` and `charge_catchup`
+        // drop the meters when they close a period, so the stamp normally
+        // already matches; the check also covers a window moved by `resume`.
+        let open = Self::read_open_period_usage(&env, &subscription, &metric);
+        let units_before = open.as_ref().map_or(0, |record| record.units);
+        let period_units = units_before
+            .checked_add(units)
+            .ok_or(ForgeError::ArithmeticOverflow)?;
+
+        let recorded = UsageRecord {
+            subscription_id,
+            metric: metric.clone(),
+            units: period_units,
+            period_start: subscription.last_charged,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Usage(subscription_id, metric), &recorded);
+        events::usage_recorded(&env, &recorded, units);
+        Ok(())
+    }
+
+    /// Read the usage recorded for `metric` in the open period (read-only
+    /// view).
+    pub fn get_usage(
+        env: Env,
+        subscription_id: u64,
+        metric: Symbol,
+    ) -> Result<UsageRecord, ForgeError> {
+        let subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        Ok(
+            Self::read_open_period_usage(&env, &subscription, &metric).unwrap_or(UsageRecord {
+                subscription_id,
+                metric,
+                units: 0,
+                period_start: subscription.last_charged,
+            }),
+        )
+    }
+
+    /// The amount the open period would bill right now (read-only view).
+    pub fn quote_period(env: Env, subscription_id: u64) -> Result<i128, ForgeError> {
+        let subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        Self::derive_period_amount(&env, &subscription)
     }
 
     /// Pause an active subscription, preventing charges while paused.
@@ -695,6 +1015,10 @@ impl SubscriptionPayments {
             status: SubscriptionStatus::Active,
             paused_at: None,
             failed_attempts: 0,
+            // Flat by default: a subscription is metered only when the
+            // subscriber declares quotas (today via `set_quotas`, and later
+            // copied from the plan it joins).
+            quotas: Vec::new(env),
         };
         env.storage()
             .instance()
@@ -767,6 +1091,188 @@ impl SubscriptionPayments {
         }
         Ok(subscriptions)
     }
+
+    /// Read this subscription's open-period amount: `amount` plus the overage
+    /// for every declared metric.
+    ///
+    /// The single storage-aware entry point to the amount derivation. A flat
+    /// subscription short-circuits to `amount` without touching the meters, so
+    /// the no-quota path is bit-identical to the pre-metering contract.
+    fn derive_period_amount(env: &Env, subscription: &Subscription) -> Result<i128, ForgeError> {
+        if subscription.quotas.is_empty() {
+            return Ok(subscription.amount);
+        }
+        let mut usage = Vec::new(env);
+        for quota in subscription.quotas.iter() {
+            if let Some(record) = Self::read_open_period_usage(env, subscription, &quota.metric) {
+                usage.push_back(record);
+            }
+        }
+        period_amount(subscription.amount, &subscription.quotas, &usage)
+    }
+
+    /// Read the open period's meter for `metric`, or `None` when the metric is
+    /// unused in the open period.
+    ///
+    /// A stored meter stamped for a different `last_charged` is ignored: the
+    /// charge paths drop meters when they close a period, so a mismatched
+    /// stamp can only come from a window moved by `resume`, whose paused
+    /// window is not billable and therefore not metered. `record_usage`
+    /// restarts the meter from the new open period.
+    fn read_open_period_usage(
+        env: &Env,
+        subscription: &Subscription,
+        metric: &Symbol,
+    ) -> Option<UsageRecord> {
+        let record: UsageRecord = env.storage().instance().get(&DataKey::Usage(
+            subscription.subscription_id,
+            metric.clone(),
+        ))?;
+        if record.period_start == subscription.last_charged {
+            Some(record)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the open period has any recorded usage, across the declared
+    /// metrics. Every meter key belongs to a currently declared metric, so
+    /// walking the quota list is exhaustive.
+    fn has_recorded_usage(env: &Env, subscription: &Subscription) -> bool {
+        subscription.quotas.iter().any(|quota| {
+            Self::read_open_period_usage(env, subscription, &quota.metric)
+                .is_some_and(|record| record.units > 0)
+        })
+    }
+
+    /// Drop every open-period meter for `subscription`.
+    ///
+    /// Called only on the settlement success path, in the same frame that
+    /// advances `last_charged`, which is what makes the period rollover atomic
+    /// with the period close. A failed transfer returns before this point, so
+    /// the meters survive and the retry charges the same amount again.
+    fn rollover_usage(env: &Env, subscription: &Subscription) {
+        for quota in subscription.quotas.iter() {
+            let key = DataKey::Usage(subscription.subscription_id, quota.metric.clone());
+            if env.storage().instance().has(&key) {
+                env.storage().instance().remove(&key);
+            }
+        }
+    }
+}
+
+/// Derive the amount billable for one period: the base `amount` plus the
+/// overage of every declared metric, from the open period's raw unit counters.
+///
+/// This is the **only** place period amounts are computed — `charge`, each
+/// settled period of `charge_catchup`, and `quote_period` all call it — so a
+/// quote, a single charge, and a catch-up bill can never disagree. It is pure:
+/// no storage, no ledger access, no authorization, and no rounding state
+/// carried between calls, which is what keeps multi-period totals exact.
+///
+/// Per metric, with `over = max(0, units - included_units)`:
+///
+/// ```text
+/// overage = ceil(min(over, max_overage_units) / bucket_units) * overage_price
+/// ```
+///
+/// where an uncapped quota skips the `min`. Rounding is up: a started bucket
+/// is billed in full. Overflow surfaces as [`ForgeError::ArithmeticOverflow`]
+/// before any transfer runs, so an unrepresentable bill can never move funds.
+fn period_amount(
+    base: i128,
+    quotas: &Vec<MetricQuota>,
+    usage: &Vec<UsageRecord>,
+) -> Result<i128, ForgeError> {
+    let mut total = base;
+    for quota in quotas.iter() {
+        let overage = metric_overage(usage_units(usage, &quota.metric), &quota)?;
+        total = total
+            .checked_add(overage)
+            .ok_or(ForgeError::ArithmeticOverflow)?;
+    }
+    Ok(total)
+}
+
+/// Overage owed for one metric's `units`: overage units past the inclusion,
+/// clamped to the quota's cap, rounded up to whole buckets, priced per bucket.
+fn metric_overage(units: u64, quota: &MetricQuota) -> Result<i128, ForgeError> {
+    let over_units = units.saturating_sub(quota.included_units);
+    let buckets = billable_buckets(over_units, quota.max_overage_units, quota.bucket_units);
+    // `u64 -> i128` is lossless, so the multiply is the only step that can
+    // overflow, and it is checked so an unrepresentable price is an error
+    // rather than a wrapped (possibly negative) bill.
+    let buckets = i128::from(buckets);
+    buckets
+        .checked_mul(quota.overage_price)
+        .ok_or(ForgeError::ArithmeticOverflow)
+}
+
+/// Billable bucket count for `over_units` under a cap and bucket size.
+///
+/// The cap is applied to overage units **before** bucketing, so a cap bills at
+/// most `ceil(cap / bucket_units)` buckets. A zero cap bills nothing and a zero
+/// bucket size bills nothing, so no input can divide by zero or wrap.
+fn billable_buckets(over_units: u64, max_overage_units: Option<u64>, bucket_units: u64) -> u64 {
+    if bucket_units == 0 {
+        // Unreachable through `set_quotas`, which rejects a zero bucket size;
+        // guarded here so the helper is total and cannot divide by zero.
+        return 0;
+    }
+    let capped = match max_overage_units {
+        Some(cap) => over_units.min(cap),
+        None => over_units,
+    };
+    capped.div_ceil(bucket_units)
+}
+
+/// Read a metric's recorded units out of a period's meter list, defaulting to
+/// zero for a metric that was never used.
+fn usage_units(usage: &Vec<UsageRecord>, metric: &Symbol) -> u64 {
+    let mut at = 0;
+    while at < usage.len() {
+        let record = usage.get_unchecked(at);
+        if &record.metric == metric {
+            return record.units;
+        }
+        at += 1;
+    }
+    0
+}
+
+/// Validate a declared quota list: at most [`MAX_QUOTAS`] entries, no metric
+/// declared twice (a duplicate would make the per-metric sum
+/// order-dependent), a non-zero bucket size, and a non-negative overage price.
+fn validate_quotas(quotas: &Vec<MetricQuota>) -> Result<(), ForgeError> {
+    if quotas.len() > MAX_QUOTAS {
+        return Err(ForgeError::InvalidInput);
+    }
+    let mut at = 0;
+    while at < quotas.len() {
+        let quota = quotas.get(at).ok_or(ForgeError::InvalidInput)?;
+        if quota.bucket_units == 0 || quota.overage_price < 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        let mut earlier = 0;
+        while earlier < at {
+            let previous = quotas.get(earlier).ok_or(ForgeError::InvalidInput)?;
+            if previous.metric == quota.metric {
+                return Err(ForgeError::InvalidInput);
+            }
+            earlier += 1;
+        }
+        at += 1;
+    }
+    Ok(())
+}
+
+/// Whether `subscription` prices `metric`, i.e. whether the provider is
+/// allowed to meter it at all.
+fn declares_metric(subscription: &Subscription, metric: &Symbol) -> bool {
+    subscription
+        .quotas
+        .iter()
+        .any(|quota| quota.metric == *metric)
 }
 
 /// Lifecycle events emitted by the subscription payments contract.
@@ -777,9 +1283,35 @@ mod events {
     pub struct Charged {
         #[topic]
         pub subscription_id: u64,
+        /// Amount actually transferred for the settled period: the derived
+        /// `base + overage` amount, not the base alone.
         pub amount: i128,
         pub last_charged: u64,
         pub next_charge_at: u64,
+    }
+
+    /// Usage metered for one metric in the open period. Indexers can rebuild
+    /// every settled period's overage from these plus the plan's quotas.
+    #[contractevent]
+    pub struct UsageRecorded {
+        #[topic]
+        pub subscription_id: u64,
+        #[topic]
+        pub metric: Symbol,
+        /// Units added by this call.
+        pub units: u64,
+        /// Running total for the open period, including this call.
+        pub period_units: u64,
+        /// The billing window these units belong to.
+        pub period_start: u64,
+    }
+
+    /// The subscription's declared quota list was replaced.
+    #[contractevent]
+    pub struct QuotasSet {
+        #[topic]
+        pub subscription_id: u64,
+        pub quotas: Vec<MetricQuota>,
     }
 
     #[contractevent]
@@ -789,15 +1321,34 @@ mod events {
         pub subscriber: Address,
     }
 
-    pub fn charged(env: &Env, subscription: &Subscription) {
+    pub fn charged(env: &Env, subscription: &Subscription, amount: i128) {
         let next_charge_at = subscription
             .last_charged
             .saturating_add(subscription.period);
         Charged {
             subscription_id: subscription.subscription_id,
-            amount: subscription.amount,
+            amount,
             last_charged: subscription.last_charged,
             next_charge_at,
+        }
+        .publish(env);
+    }
+
+    pub fn usage_recorded(env: &Env, record: &UsageRecord, units: u64) {
+        UsageRecorded {
+            subscription_id: record.subscription_id,
+            metric: record.metric.clone(),
+            units,
+            period_units: record.units,
+            period_start: record.period_start,
+        }
+        .publish(env);
+    }
+
+    pub fn quotas_set(env: &Env, subscription: &Subscription) {
+        QuotasSet {
+            subscription_id: subscription.subscription_id,
+            quotas: subscription.quotas.clone(),
         }
         .publish(env);
     }
@@ -813,6 +1364,8 @@ mod events {
 
 #[cfg(test)]
 mod authz;
+#[cfg(test)]
+mod metering;
 #[cfg(test)]
 mod props;
 

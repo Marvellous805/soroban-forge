@@ -9,8 +9,12 @@ pull a fixed `amount` per `period` (seconds) through SEP-41 token transfers.
 fn subscribe(subscriber, provider, token, amount, period) -> Result<u64, ForgeError>
 fn charge(subscription_id) -> Result<i128, ForgeError>
 fn charge_catchup(subscription_id, max_periods: u32) -> Result<i128, ForgeError>
+fn set_quotas(subscription_id, quotas: Vec<MetricQuota>) -> Result<(), ForgeError>
+fn record_usage(subscription_id, metric: Symbol, units: u64) -> Result<(), ForgeError>
+fn quote_period(subscription_id) -> Result<i128, ForgeError>
 fn cancel(subscription_id) -> Result<(), ForgeError>
 fn get_subscription(subscription_id) -> Result<Subscription, ForgeError>
+fn get_usage(subscription_id, metric: Symbol) -> Result<UsageRecord, ForgeError>
 fn get_subscription_count() -> u64
 fn subscriptions_for_subscriber(subscriber, offset, limit) -> Result<Vec<Subscription>, ForgeError>
 fn subscriptions_for_provider(provider, offset, limit) -> Result<Vec<Subscription>, ForgeError>
@@ -26,6 +30,63 @@ elapsed_periods)` periods in one atomic invocation. `max_periods == 0` is a
   policy. A failed catch-up transfer returns `TokenTransferFailed` and rolls
   back all transfers and `last_charged` through Soroban frame rollback.
 - `cancel` requires the subscriber and prevents further charges.
+- `set_quotas`, `record_usage`, and the metering views are described under
+  [Metered usage](#metered-usage-quotas-and-overage).
+
+## Metered usage: quotas and overage
+
+A subscription can declare up to 16 per-metric quotas, so a period bills
+`amount` plus overage for real consumption. **No quotas means the original flat
+flow**: the charged amount and every event payload are identical to a contract
+without this feature.
+
+```rust
+struct MetricQuota {
+    metric: Symbol,             // e.g. api_calls
+    included_units: u64,        // covered by the base `amount`
+    overage_price: i128,        // per started bucket
+    bucket_units: u64,          // units per bucket, must be > 0
+    max_overage_units: Option<u64>, // cap on billable overage units
+}
+```
+
+The billable amount for one period is derived in a single pure helper used by
+`charge`, by every period of `charge_catchup`, and by `quote_period`:
+
+```text
+amount = base
+       + Σ over metric of ceil(min(max(0, units - included), cap) / bucket) * overage_price
+```
+
+with the `min` skipped for an uncapped quota.
+
+- `set_quotas` requires the **subscriber** — a quota prices what the subscriber
+  is billed, so the charged account consents to the terms. It is rejected unless
+  the subscription is `Active` and the open period has no recorded usage, so
+  already-metered units can never be repriced mid-period. An empty list returns
+  the subscription to flat pricing.
+- `record_usage` requires the **provider**, mirroring who may `charge`, and
+  rejects a metric the subscription does not declare, so usage the subscriber
+  has not been asked to pay for can never be billed.
+- `record_usage` accumulates **raw units** for the open period only, so each
+  period's amount is a pure function of that period's units: charging `N`
+  periods bills exactly `N` times the per-period derivation, and no rounding can
+  compound across periods. A bucket is billed once started (rounded up), and the
+  price is per bucket, never per unit.
+- Meters are dropped atomically with the charge that closes the period, in the
+  same frame that advances `last_charged`. A failed transfer returns before that
+  point, so every meter survives and the arrears retry re-derives an identical
+  amount.
+- `charge_catchup` settles the open period **last**: usage can only be metered
+  into the open (latest) period, so earlier unsettled periods bill the base
+  amount and only the final one carries overage.
+- `record_usage` requires `Active`, which freezes the meter at the attempted
+  amount once a charge has failed, so the `PastDue` retry is identical to the
+  attempt that failed.
+- Caps are enforced by clamping at settlement, never by rejecting, so a usage
+  spike cannot wedge a subscription; the subscriber's worst case per period is
+  `base + Σ caps`. A `u64` unit-counter overflow surfaces as
+  `ArithmeticOverflow` rather than wrapping into a silent underbill.
 
 ## Subscription States
 
@@ -66,19 +127,26 @@ of `0` fails with `ForgeError::InvalidInput`.
 - `Count` — monotonic subscription id counter.
 - `SubscriberSubscriptions(address)` — subscriber id index.
 - `ProviderSubscriptions(address)` — provider id index.
+- `Usage(subscription_id, metric)` — the open period's raw unit counter for one
+  metric, stamped with the `last_charged` window it belongs to; removed by the
+  charge that closes the period.
 
 ## Payment Semantics
 
 `charge` returns the billed amount, or `0` when no full period has elapsed since
 the last charge. `charge_catchup` returns the total billed amount and advances
 `last_charged` once per successfully settled period. Period and total arithmetic
-uses checked operations.
+uses checked operations. For a metered subscription the billed amount is the
+derived `base + overage` amount rather than `amount` alone; it is computed
+before the transfer, so an unrepresentable bill never moves funds.
 
 ## Events
 
 The contract emits typed on-chain lifecycle events for indexers and off-chain monitoring:
 
 - `Subscribed` (topic: `subscription_id: u64`) — emitted when a subscription is created via `subscribe`. Contains `subscriber`, `provider`, `token`, `amount`, and `period`.
-- `Charged` (topic: `subscription_id: u64`) — emitted on successful billing via `charge` (one event) or `charge_catchup` (one event per settled period). Contains `amount`, `last_charged`, and `next_charge_at`.
+- `Charged` (topic: `subscription_id: u64`) — emitted on successful billing via `charge` (one event) or `charge_catchup` (one event per settled period). Contains `amount`, `last_charged`, and `next_charge_at`. For a metered subscription `amount` is the derived `base + overage` amount, not the base alone.
+- `UsageRecorded` (topics: `subscription_id: u64`, `metric: Symbol`) — emitted per `record_usage` call. Contains the `units` added, the running `period_units` for the open period, and the `period_start` window those units belong to, so an indexer can rebuild each settled period's overage.
+- `QuotasSet` (topic: `subscription_id: u64`) — emitted when `set_quotas` replaces the declared terms. Contains the full `quotas` list, so the pricing an indexer needs travels with the event.
 - `Cancelled` (topic: `subscription_id: u64`) — emitted when a subscription is cancelled via `cancel`. Contains `subscriber`.
 
