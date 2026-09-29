@@ -1,13 +1,13 @@
 # @soroban-forge/escrow-client
 
-Generated TypeScript client for the **Soroban Forge escrow contract**, live on
-Stellar testnet:
+Unified TypeScript package with generated, strongly typed clients for all six
+Soroban Forge contracts: escrow, vesting, multi-sig wallet, DAO governance,
+subscription payments, and marketplace royalties. The package name is retained
+for compatibility with existing escrow client consumers.
 
-> `CC227UDF6WBLRTOKKVRIJN7BGSBK67ZGV6IDARJ2AMATGSQ7UZNBZHSB`
-
-The client is generated from the deployed contract's ABI by the Stellar CLI, so
-every method is fully typed and carries the doc comments from the contract
-source.
+Each client is generated from its contract WASM using the Stellar CLI. This is
+an offline build step and does not require deployed contract IDs or network
+access.
 
 ## Install
 
@@ -29,14 +29,21 @@ published; the `src/` source is authoritative.
 ## Usage
 
 ```ts
-import { Client, networks } from "@soroban-forge/escrow-client";
+import {
+  escrow,
+  vesting,
+  multisig,
+  dao,
+  subscription,
+  marketplace,
+} from "@soroban-forge/escrow-client";
 
-const client = new Client({
-  ...networks.testnet,
+const client = new escrow.Client({
+  ...escrow.networks.testnet,
   rpcUrl: "https://soroban-testnet.stellar.org", // or your own RPC
 });
 
-// Every contract method is available, typed, with `try*` variants:
+// Every contract client provides typed methods and `try*` variants.
 const id = await client.create_escrow({
   buyer: "C…",
   seller: "C…",
@@ -52,12 +59,46 @@ await client.dispute({ escrow_id: id.result, claimant: seller });
 await client.resolve({ escrow_id: id.result, in_favor_of_seller: true });
 await client.get_status({ escrow_id: id.result });
 await client.touch_ttl({ escrow_id: id.result }); // permissionless keeper
+
+// The other generated clients are namespaced the same way:
+const vestingClient = new vesting.Client({
+  contractId: "<VESTING_CONTRACT_ID>",
+  networkPassphrase: "Test SDF Network ; September 2015",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+});
 ```
 
-The `networks` export carries the embedded `contractId` and network passphrase;
-pass your own `rpcUrl`.  Signers/wallets are supplied per call via
-`MethodOptions` (`sign`, `simulate`, etc.) — see the
+Each namespace exposes its own `Client` and contract-specific types. The
+escrow client includes its existing `networks.testnet` preset; provide a
+contract ID, network passphrase, and `rpcUrl` for the other clients.
+Signers/wallets are supplied per call via `MethodOptions` (`sign`, `simulate`,
+etc.). See the
 [stellar-sdk contract client docs](https://stellar.github.io/js-stellar-sdk/).
+
+## Generate all clients
+
+From this directory, run:
+
+```bash
+npm run generate
+```
+
+The script builds all six contract crates for `wasm32v1-none` with Cargo's
+locked release configuration, then generates typed bindings from each WASM.
+The unified package modules are written to `src/clients/`; the five standalone
+client packages are regenerated alongside them. Contract mappings and output
+names are defined in `scripts/generate.mjs`. Generation requires stable Rust,
+the `wasm32v1-none` target, and the Stellar CLI; it does not require network
+access.
+
+| Contract | Unified package export | Standalone package |
+| --- | --- | --- |
+| Escrow | `escrow` | `@soroban-forge/escrow-client` |
+| Vesting | `vesting` | `@soroban-forge/vesting-client` |
+| Multi-Sig Wallet | `multisig` | `@soroban-forge/multi-sig-wallet-client` |
+| DAO Governance | `dao` | `@soroban-forge/dao-governance-client` |
+| Subscription Payments | `subscription` | `@soroban-forge/subscription-payments-client` |
+| Marketplace Royalties | `marketplace` | `@soroban-forge/marketplace-royalties-client` |
 
 ## Offline tests
 
@@ -84,33 +125,6 @@ Run the TypeScript compiler in check-only mode (no output emitted):
 ```bash
 npm run typecheck
 ```
-
-## Client regeneration
-
-The client (`src/index.ts`) is **generated** from the deployed contract's ABI
-and must not be edited by hand.  Manual edits will be overwritten the next time
-the contract interface changes.
-
-To regenerate after a contract interface change, run:
-
-```bash
-stellar contract bindings typescript \
-  --contract-id CC227UDF6WBLRTOKKVRIJN7BGSBK67ZGV6IDARJ2AMATGSQ7UZNBZHSB \
-  --network testnet \
-  --output-dir packages/typescript-sdk --overwrite
-```
-
-This requires the [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli)
-and a live connection to Stellar testnet.  After regeneration:
-
-1. Rebuild: `npm run build`
-2. Run the offline tests: `npm test` — any ABI-breaking change will cause a
-   test failure that makes the drift visible before merging.
-
-The generation command, the deployed contract ID, and the testnet passphrase are
-the authoritative source of truth.  If the contract is redeployed at a new
-address, update the `--contract-id` flag above and the `networks.testnet`
-configuration in the regenerated `src/index.ts`.
 
 ## Optional testnet verification
 

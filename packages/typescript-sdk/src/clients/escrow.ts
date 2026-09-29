@@ -24,7 +24,6 @@ import type {
 export * from "@stellar/stellar-sdk";
 export * as contract from "@stellar/stellar-sdk/contract";
 export * as rpc from "@stellar/stellar-sdk/rpc";
-export * from "./clients/index.js";
 
 if (typeof window !== "undefined") {
   //@ts-ignore Buffer exists
@@ -90,7 +89,7 @@ export type EscrowStatus = {tag: "Pending", values: void} | {tag: "Funded", valu
 
 /**
  * A page of escrow ids involving a participant.
- * 
+ *
  * Returned by [`SorobanForgeEscrow::escrows_for_participant`]; powered by
  * the per-party persistent index written at creation.
  */
@@ -139,7 +138,7 @@ role: string;
 
 /**
  * Inclusive time window expressed as Unix timestamps (seconds).
- * 
+ *
  * Stored as plain `u64` because `soroban_sdk` models time as `u64`; a
  * dedicated newtype would add conversions without benefit.
  */
@@ -157,7 +156,7 @@ start: u64;
 
 /**
  * A page of results plus the cursor needed to fetch the next page.
- * 
+ *
  * Items are stored as serialized `Bytes` so the helper is agnostic to the
  * concrete value type a contract paginates. Callers decode each item into
  * their domain type. `Debug` is omitted because the SDK collection does not
@@ -195,12 +194,12 @@ offset: u32;
 
 /**
  * Shared error type used across all Soroban Forge contracts.
- * 
+ *
  * Defining a single error enum in `shared-utils` keeps the on-chain error
  * space consistent and intelligible to SDK consumers, and avoids every
  * contract re-declaring the same failure modes. Contract crates may expose
  * their own domain-specific errors, but should prefer these where they fit.
- * 
+ *
  * Error codes start at 1; code 0 is reserved by the Soroban host.
  */
 export const ForgeError = {
@@ -273,7 +272,7 @@ export const ForgeError = {
 
 /**
  * Audit metadata attached to a persisted value.
- * 
+ *
  * Contracts store domain data in Soroban instance storage; wrapping it with
  * this record lets callers (and off-chain indexers) see when a value was last
  * written. The payload is stored as opaque serialized bytes so the record is
@@ -302,7 +301,7 @@ export interface Client {
   /**
    * Construct and simulate a refund transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Refund the buyer.
-   * 
+   *
    * Pre-deadline: seller authorizes (voluntary refund). Post-deadline:
    * buyer authorizes (reclaim of unfulfilled funds).
    */
@@ -311,7 +310,7 @@ export interface Client {
   /**
    * Construct and simulate a deposit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Fund the escrow, pulling tokens from the buyer into this contract.
-   * 
+   *
    * Ordering: transfer **first**, state write **second** — see the
    * module docs for why the inverse would be a fund-safety bug.
    */
@@ -362,7 +361,7 @@ export interface Client {
   /**
    * Construct and simulate a create_escrow transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Create a new escrow and return its stable id.
-   * 
+   *
    * Only the buyer authorizes at creation. The arbiter does not
    * authorize either: they must be able to `resolve` later even if
    * they never participated in creation.

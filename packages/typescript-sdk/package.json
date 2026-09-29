@@ -1,7 +1,7 @@
 {
   "version": "0.2.0",
   "name": "@soroban-forge/escrow-client",
-  "description": "Generated TypeScript client for the Soroban Forge escrow contract (deployed on Stellar testnet: CC227UDF6WBLRTOKKVRIJN7BGSBK67ZGV6IDARJ2AMATGSQ7UZNBZHSB)",
+  "description": "Unified TypeScript SDK with generated clients for all six Soroban Forge contracts",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
@@ -14,6 +14,8 @@
     "dist"
   ],
   "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "generate:clients": "node scripts/generate.mjs",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsc && tsc --project tsconfig.test.json && node --test dist-test/tests/escrow-client.test.js",
