@@ -2330,22 +2330,6 @@ mod tests {
         client.cancel(&subscription_id);
         env.ledger().set_timestamp(START + PERIOD * 3);
         assert_eq!(client.due_periods(&subscription_id), 3);
-            &PERIOD,
-        );
-
-        let first = client.subscriptions_for_subscriber(&accounts.user1, &0, &2);
-        assert_eq!(first.len(), 2);
-        assert_eq!(first.get_unchecked(0).subscription_id, 1);
-        assert_eq!(first.get_unchecked(1).subscription_id, 2);
-
-        let mid = client.subscriptions_for_subscriber(&accounts.user1, &2, &2);
-        assert_eq!(mid.len(), 2);
-        assert_eq!(mid.get_unchecked(0).subscription_id, 3);
-        assert_eq!(mid.get_unchecked(1).subscription_id, 4);
-
-        let last = client.subscriptions_for_subscriber(&accounts.user1, &4, &10);
-        assert_eq!(last.len(), 1);
-        assert_eq!(last.get_unchecked(0).subscription_id, 5);
     }
 
     #[test]

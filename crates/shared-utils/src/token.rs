@@ -168,7 +168,12 @@ mod tests {
 
     #[contractimpl]
     impl DepositProxy {
-        pub fn run(env: Env, token: Address, from: Address, amount: i128) -> Result<(), ForgeError> {
+        pub fn run(
+            env: Env,
+            token: Address,
+            from: Address,
+            amount: i128,
+        ) -> Result<(), ForgeError> {
             // Require the sender's auth at the entrypoint, exactly as escrow's
             // `deposit` does, so mock_all_auths covers the nested token transfer.
             from.require_auth();

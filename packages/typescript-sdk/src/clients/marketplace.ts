@@ -323,10 +323,6 @@ export interface Client {
   get_settlement_summary: ({collection}: {collection: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<SettlementSummary>>>
 
 }
-export interface Client {
-  readonly spec: ContractSpec;
-  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;
-}
 export class Client extends ContractClient {
   static async deploy<T = Client>(
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */

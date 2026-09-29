@@ -418,10 +418,6 @@ export interface Client {
   get_proposal_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
 
 }
-export interface Client {
-  readonly spec: ContractSpec;
-  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;
-}
 export class Client extends ContractClient {
   static async deploy<T = Client>(
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */

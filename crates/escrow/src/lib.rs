@@ -199,7 +199,7 @@ compile_error!(
 );
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, Address, Env, Vec,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
 };
 
 use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};

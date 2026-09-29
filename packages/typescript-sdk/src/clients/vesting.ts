@@ -290,10 +290,6 @@ export interface Client {
   create_schedule: ({beneficiary, token, total_amount, cliff, duration}: {beneficiary: string, token: string, total_amount: i128, cliff: u64, duration: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
 
 }
-export interface Client {
-  readonly spec: ContractSpec;
-  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;
-}
 export class Client extends ContractClient {
   static async deploy<T = Client>(
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */

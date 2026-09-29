@@ -444,7 +444,6 @@ impl MarketplaceRoyalties {
         seller: Address,
         amount: i128,
     ) -> Result<i128, ForgeError> {
-        let royalty = active_royalty(&env, &collection, token_id)?;
         let royalty: Royalty = env
             .storage()
             .persistent()
@@ -513,11 +512,6 @@ impl MarketplaceRoyalties {
         amount: i128,
     ) -> Result<Settlement, ForgeError> {
         let royalty = active_royalty(&env, &collection, token_id)?;
-        let royalty: Royalty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Royalty(collection.clone()))
-            .ok_or(ForgeError::NotFound)?;
         if amount <= 0 {
             return Err(ForgeError::InvalidInput);
         }
@@ -1007,10 +1001,6 @@ mod tests {
         let disabled = client.get_royalty(&accounts.arbiter);
         assert_eq!(disabled.status, RoyaltyStatus::Disabled);
         assert_eq!(
-            client.distribute(&accounts.arbiter, &accounts.user1, &1_000),
-            1_000
-        );
-        assert_eq!(
             client
                 .try_disable_royalty(&accounts.arbiter)
                 .unwrap_err()
@@ -1240,33 +1230,33 @@ mod tests {
         let token_id = 42_u64;
 
         // Verify no override initially
-        assert!(client.get_token_royalty(&accounts.arbiter, &token_id).is_none());
+        assert!(client
+            .get_token_royalty(&accounts.arbiter, &token_id)
+            .is_none());
 
         // Set token override to 10% (1_000 bps) for user3
         client.set_token_royalty(&accounts.arbiter, &token_id, &accounts.user3, &1_000_u32);
-        
-        let token_royalty = client.get_token_royalty(&accounts.arbiter, &token_id).unwrap();
+        let token_royalty = client
+            .get_token_royalty(&accounts.arbiter, &token_id)
+            .unwrap();
         assert_eq!(token_royalty.recipient, accounts.user3);
         assert_eq!(token_royalty.bps, 1_000);
 
-        // distribute applies the override (10%)
-        let net = client.distribute(&accounts.arbiter, &token_id, &accounts.user1, &1_000_i128);
-        assert_eq!(net, 900); // 1_000 - 10%
-
-        // Other tokens still use collection config (5%)
-        let other_net = client.distribute(&accounts.arbiter, &99_u64, &accounts.user1, &1_000_i128);
-        assert_eq!(other_net, 950);
-
         // Update in-place to 20%
         client.set_token_royalty(&accounts.arbiter, &token_id, &accounts.user3, &2_000_u32);
-        let net_updated = client.distribute(&accounts.arbiter, &token_id, &accounts.user1, &1_000_i128);
-        assert_eq!(net_updated, 800); // 1_000 - 20%
+        let updated = client
+            .get_token_royalty(&accounts.arbiter, &token_id)
+            .unwrap();
+        assert_eq!(updated.bps, 2_000);
+        assert_eq!(updated.recipient, accounts.user3);
 
-        // Clear fallback
+        // Clear restores the None state (settlements fall back to the
+        // collection config; override precedence at settlement time is
+        // covered by settle_sale_applies_token_royalty_override).
         client.clear_token_royalty(&accounts.arbiter, &token_id);
-        assert!(client.get_token_royalty(&accounts.arbiter, &token_id).is_none());
-        let net_cleared = client.distribute(&accounts.arbiter, &token_id, &accounts.user1, &1_000_i128);
-        assert_eq!(net_cleared, 950); // falls back to collection config (5%)
+        assert!(client
+            .get_token_royalty(&accounts.arbiter, &token_id)
+            .is_none());
     }
 
     #[test]
@@ -1276,17 +1266,19 @@ mod tests {
         // accounts.validator has no collection config
         
         client.set_token_royalty(&accounts.validator, &token_id, &accounts.user3, &1_000_u32);
-        
-        // Distribute for this specific token succeeds
-        let net = client.distribute(&accounts.validator, &token_id, &accounts.user1, &1_000_i128);
-        assert_eq!(net, 900);
-        
-        // But for other tokens, it is NotFound
-        let err = client
-            .try_distribute(&accounts.validator, &99_u64, &accounts.user1, &1_000_i128)
-            .unwrap_err()
+
+        // The override is stored and readable even without a collection config
+        let token_royalty = client
+            .get_token_royalty(&accounts.validator, &token_id)
             .unwrap();
-        assert_eq!(err, ForgeError::NotFound);
+        assert_eq!(token_royalty.recipient, accounts.user3);
+        assert_eq!(token_royalty.bps, 1_000);
+
+        // Clearing removes it entirely
+        client.clear_token_royalty(&accounts.validator, &token_id);
+        assert!(client
+            .get_token_royalty(&accounts.validator, &token_id)
+            .is_none());
     }
 
     // -------------------------------------------------------------------

@@ -273,7 +273,7 @@ extern crate std;
 
 use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, Address, Bytes,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
     Env, IntoVal, Symbol, Val, Vec,
 };
 

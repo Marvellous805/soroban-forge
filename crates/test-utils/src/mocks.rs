@@ -130,6 +130,9 @@ mod tests {
         token1.mint(&accounts.user1, &500);
         assert_eq!(token1.balance(&accounts.user1), 500);
         assert_eq!(token2.balance(&accounts.user1), 0);
+    }
+}
+
 /// Mock target contract for testing cross-contract invocations.
 ///
 /// Records the execution count and last dispatched payload in instance storage.

@@ -106,7 +106,7 @@ extern crate std;
 
 use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, Address, Bytes,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
     Env, IntoVal, Symbol, Val,
 };
 
@@ -472,7 +472,13 @@ impl DaoGovernance {
                 return Err(ForgeError::InvalidInput);
             }
         }
-        if env.storage().instance().get::<_, u64>(&DataKey::Count).unwrap_or(0) != 0 {
+        if env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::Count)
+            .unwrap_or(0)
+            != 0
+        {
             return Err(ForgeError::InvalidInput);
         }
 
@@ -552,7 +558,14 @@ impl DaoGovernance {
         action: Bytes,
         duration: u64,
     ) -> Result<u64, ForgeError> {
-        Self::propose_impl(env, proposer, target, action, duration, ProposalCategory::Standard)
+        Self::propose_impl(
+            env,
+            proposer,
+            target,
+            action,
+            duration,
+            ProposalCategory::Standard,
+        )
     }
 
     /// Create a proposal using the selected category's configured voting period.

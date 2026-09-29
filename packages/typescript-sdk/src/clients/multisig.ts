@@ -575,10 +575,6 @@ export interface Client {
   get_transactions_by_status: ({status, offset, limit}: {status: TxStatus, offset: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Array<WalletTx>>>>
 
 }
-export interface Client {
-  readonly spec: ContractSpec;
-  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;
-}
 export class Client extends ContractClient {
   static async deploy<T = Client>(
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */
