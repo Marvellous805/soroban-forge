@@ -92,7 +92,45 @@
 extern crate std;
 
 use soroban_forge_shared_utils::{transfer_from_contract, ForgeError};
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contractclient, contractevent, contractimpl, contracttype, Address, Env, Vec};
+
+mod events {
+    use super::*;
+
+    #[contractevent]
+    pub struct ScheduleCreated {
+        #[topic]
+        pub schedule_id: u64,
+        pub schedule: VestingSchedule,
+    }
+
+    #[contractevent]
+    pub struct Claimed {
+        #[topic]
+        pub schedule_id: u64,
+        pub amount: i128,
+        pub claimed: i128,
+        pub status: VestingStatus,
+    }
+
+    pub fn schedule_created(env: &Env, schedule_id: u64, schedule: &VestingSchedule) {
+        ScheduleCreated {
+            schedule_id,
+            schedule: schedule.clone(),
+        }
+        .publish(env);
+    }
+
+    pub fn claimed(env: &Env, schedule_id: u64, amount: i128, total: i128, status: VestingStatus) {
+        Claimed {
+            schedule_id,
+            amount,
+            claimed: total,
+            status,
+        }
+        .publish(env);
+    }
+}
 
 /// Maximum number of tranches a single schedule may carry.
 ///
@@ -374,6 +412,7 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(id), &schedule);
+        events::schedule_created(&env, id, &schedule);
 
         let mut schedules: soroban_sdk::Vec<u64> = env
             .storage()
@@ -383,7 +422,7 @@ impl Vesting {
         schedules.push_back(id);
         env.storage()
             .instance()
-            .set(&DataKey::BeneficiarySchedules(beneficiary), &schedules);
+            .set(&DataKey::BeneficiarySchedules(beneficiary.clone()), &schedules);
 
         Ok(id)
     }

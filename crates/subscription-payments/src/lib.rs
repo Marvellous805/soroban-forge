@@ -738,7 +738,8 @@ impl SubscriptionPayments {
         }
         if period == 0 {
             return Err(ForgeError::InvalidInput);
-        }        subscriber.require_auth();
+        }
+        subscriber.require_auth();
 
         Self::create_subscription(
             &env,
@@ -828,7 +829,8 @@ impl SubscriptionPayments {
         // subscriber funds.
         if !Self::is_provider_authorized_impl(&env, &subscriber, &provider) {
             return Err(ForgeError::Unauthorized);
-        }        provider.require_auth();
+        }
+        provider.require_auth();
 
         Self::create_subscription(
             &env,
