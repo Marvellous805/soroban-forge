@@ -1881,6 +1881,27 @@ fn split_amount(amount: i128, seller_bps: u32) -> Result<(i128, i128), ForgeErro
 /// pattern: cheap no-op while the entry is fresh, decisive near expiry.
 fn bump_entry(env: &Env, key: &DataKey) {
     shared_bump_entry(env, key);
+    // Mirror the escrow record's expiration ledger for `ttl_info`: SDK 27
+    // exposes TTL introspection to test utilities but not contract code, so
+    // the contract keeps its own copy in lockstep with every bump.
+    if let DataKey::Escrow(escrow_id) = key {
+        let expiration_key = DataKey::EscrowExpiration(*escrow_id);
+        let sequence = env.ledger().sequence();
+        let prior = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&expiration_key);
+        let expiration = match prior {
+            Some(ledger) if ledger.saturating_sub(sequence) > crate::ttl::BUMP_THRESHOLD => ledger,
+            _ => sequence.saturating_add(crate::ttl::BUMP_AMOUNT),
+        };
+        env.storage().persistent().set(&expiration_key, &expiration);
+        env.storage().persistent().extend_ttl(
+            &expiration_key,
+            crate::ttl::BUMP_THRESHOLD,
+            crate::ttl::BUMP_AMOUNT,
+        );
+    }
 }
 
 /// Lifecycle events. The escrow id is a **topic** so indexers can filter

@@ -64,7 +64,7 @@ pub fn transfer_to_contract(
 ) -> Result<(), ForgeError> {
     match token::TokenClient::new(env, token).try_transfer(
         from,
-        &env.current_contract_address(),
+        env.current_contract_address(),
         &amount,
     ) {
         Ok(Ok(())) => Ok(()),
