@@ -69,8 +69,8 @@
 //! Authorization model:
 //! - `create_schedule` and `create_tranche_schedule` require the beneficiary.
 //! - `claim` requires the beneficiary.
-//! - `claimable`, `get_status`, and `get_tranche_schedule` are read-only
-//!   views.
+//! - `claimable`, `get_status`, `get_schedule`, and `get_tranche_schedule`
+//!   are read-only views.
 //!
 //! ## Settlement (load-bearing)
 //!
@@ -151,11 +151,30 @@ pub trait SorobanForgeVesting {
         tranches: Vec<Tranche>,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
 
+    /// Read the full linear schedule record (read-only view).
+    ///
+    /// The record view for the linear kind, mirroring
+    /// `get_tranche_schedule` and the workspace's other record views
+    /// (`get_escrow`, `get_tx`, `get_proposal`, `get_subscription`) — the
+    /// record-view convention of issue #125. Returns the stored record:
+    /// `claimed` reflects completed claims, while `status` is the stored
+    /// lifecycle state and is refreshed on claim (between claims
+    /// `get_status` derives the current one from ledger time).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no linear schedule with this id (a
+    ///   tranche id is `NotFound` here, and vice versa).
+    fn get_schedule(
+        env: Env,
+        schedule_id: u64,
+    ) -> Result<VestingSchedule, soroban_forge_shared_utils::ForgeError>;
+
     /// Read the full tranche schedule record, immutable unlock table included
     /// (read-only view).
     ///
-    /// The record-view counterpart of `get_schedule` (proposed for the linear
-    /// kind in issue #125); a linear id is `NotFound` here, and vice versa.
+    /// The tranche kind's record view, mirroring `get_schedule` (the linear
+    /// kind's, issue #125); a linear id is `NotFound` here, and vice versa.
     fn get_tranche_schedule(
         env: Env,
         schedule_id: u64,
@@ -382,6 +401,18 @@ impl Vesting {
             .instance()
             .set(&DataKey::TrancheSchedule(id), &schedule);
         Ok(id)
+    }
+
+    /// Read the full linear schedule record (read-only view; no state
+    /// change).
+    ///
+    /// Mirrors `get_tranche_schedule`: the stored record, unchanged. A
+    /// tranche id is `NotFound` here; use `get_tranche_schedule` for those.
+    pub fn get_schedule(env: Env, schedule_id: u64) -> Result<VestingSchedule, ForgeError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Schedule(schedule_id))
+            .ok_or(ForgeError::NotFound)
     }
 
     /// Read the full tranche schedule record, unlock table included
