@@ -900,9 +900,7 @@ impl SubscriptionPayments {
                 // Period rollover: the meters go in the same frame that closes
                 // the period, so the next period starts from zero units.
                 Self::rollover_usage(&env, &subscription);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &subscription);
+                Self::store_subscription(&env, subscription_id, &subscription);
                 events::charged(&env, &subscription, amount);
                 Ok(amount)
             }
@@ -1005,9 +1003,7 @@ impl SubscriptionPayments {
         subscription.subscriber.require_auth();
 
         subscription.quotas = quotas;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         events::quotas_set(&env, &subscription);
         Ok(())
     }
@@ -1276,9 +1272,7 @@ impl SubscriptionPayments {
             failed_attempts: 0,
             quotas,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         Self::append_index(
             env,
             &DataKey::SubscriberSubscriptions(subscriber),
