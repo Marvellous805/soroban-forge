@@ -143,22 +143,7 @@ use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
 };
 
-use soroban_forge_shared_utils::ForgeError;
-
-/// Ledger-time constants for TTL bumps.
-///
-/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
-/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
-/// is how close to expiry an entry must be before a bump applies. The
-/// 30-day horizon comfortably covers a funded escrow between keeper
-/// touches.
-mod ttl {
-    pub const DAY_IN_LEDGERS: u32 = 17_280;
-    /// Lifetime applied on every TTL touch.
-    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-    /// Bump only when the entry is within this window of expiring.
-    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-}
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 
 /// Public interface for the Soroban Forge escrow contract.
 #[contractclient(name = "SorobanForgeEscrowClient")]
@@ -278,6 +263,15 @@ pub trait SorobanForgeEscrow {
     ///   the payout.
     fn resolve(env: Env, escrow_id: u64, in_favor_of_seller: bool) -> Result<(), ForgeError>;
 
+    /// Resolve a dispute with a basis-point split between seller and buyer.
+    ///
+    /// Requires the arbiter; only valid while `Disputed` and only for
+    /// `seller_bps <= 10_000`. The seller share is computed as
+    /// `amount * seller_bps / 10_000`, with the remainder retained by the
+    /// buyer. The split is final and settles both transfers atomically.
+    fn resolve_split(env: Env, escrow_id: u64, seller_bps: u32) -> Result<(), ForgeError>;
+
+    /// Cancel a `Pending` escrow before it is funded. Requires the buyer.
     /// Cancel a `Pending` escrow before it is funded. Requires the buyer and
     /// removes its id from each distinct party's participant index.
     ///
@@ -331,8 +325,9 @@ pub trait SorobanForgeEscrow {
     ) -> ParticipantEscrowsPage;
 
     /// Permissionless TTL keeper: bumps the escrow entry's TTL to the
-    /// [`ttl::BUMP_AMOUNT`] horizon when it falls inside
-    /// [`ttl::BUMP_THRESHOLD`]. Call periodically for escrows that must
+    /// [`soroban_forge_shared_utils::ttl::BUMP_AMOUNT`] horizon when it
+    /// falls inside [`soroban_forge_shared_utils::ttl::BUMP_THRESHOLD`].
+    /// Call periodically for escrows that must
     /// outlive their entry's current TTL. Costs fees; changes nothing
     /// else.
     ///
@@ -790,6 +785,49 @@ impl Escrow {
         Ok(())
     }
 
+    /// Resolve a dispute by splitting the escrowed amount between the seller
+    /// and buyer according to `seller_bps` out of 10_000.
+    ///
+    /// The seller share is floored at `amount * seller_bps / 10_000` and the
+    /// remainder stays with the buyer. `seller_bps == 0` resolves to a
+    /// buyer-only refund and `seller_bps == 10_000` resolves to a full seller
+    /// payout. A failed second payout rolls back the whole invocation.
+    pub fn resolve_split(env: Env, escrow_id: u64, seller_bps: u32) -> Result<(), ForgeError> {
+        let escrow = Self::load_escrow(&env, escrow_id)?;
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(ForgeError::InvalidInput);
+        }
+        if seller_bps > 10_000 {
+            return Err(ForgeError::InvalidInput);
+        }
+        escrow.arbiter.require_auth();
+
+        let remaining = escrow.remaining();
+        let (seller_share, buyer_share) = split_amount(remaining, seller_bps)?;
+        let mut resolved = escrow;
+
+        if seller_share > 0 {
+            transfer_from_contract(&env, &resolved.token, &resolved.seller, seller_share)?;
+        }
+        if buyer_share > 0 {
+            transfer_from_contract(&env, &resolved.token, &resolved.buyer, buyer_share)?;
+        }
+
+        resolved.released = resolved.amount;
+        resolved.status = if seller_share == 0 {
+            EscrowStatus::Refunded
+        } else {
+            EscrowStatus::Completed
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &resolved);
+        bump_entry(&env, &DataKey::Escrow(escrow_id));
+        events::resolved_split(&env, &resolved, seller_bps, seller_share, buyer_share);
+        Ok(())
+    }
+
     /// Cancel a `Pending` escrow. Requires the buyer. Nothing has moved,
     /// so no token transfer occurs.
     pub fn cancel(env: Env, escrow_id: u64) -> Result<(), ForgeError> {
@@ -1020,13 +1058,39 @@ fn transfer_from_contract(
     }
 }
 
-/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
-/// it falls inside [`ttl::BUMP_THRESHOLD`]. The standard threshold/extend
-/// pattern: cheap no-op while the entry is fresh, decisive near expiry.
+/// Split a non-negative amount by basis points without overflowing an
+/// intermediate `amount * seller_bps` multiplication.
+fn split_amount(amount: i128, seller_bps: u32) -> Result<(i128, i128), ForgeError> {
+    let denominator = 10_000_i128;
+    let seller_bps = i128::from(seller_bps);
+    let whole = amount
+        .checked_div(denominator)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let remainder = amount
+        .checked_rem(denominator)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let seller_share = whole
+        .checked_mul(seller_bps)
+        .and_then(|value| {
+            remainder
+                .checked_mul(seller_bps)
+                .and_then(|fraction| value.checked_add(fraction / denominator))
+        })
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let buyer_share = amount
+        .checked_sub(seller_share)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    Ok((seller_share, buyer_share))
+}
+
+/// Bump a persistent entry's TTL to the workspace policy's 30-day horizon
+/// when it falls inside its one-day threshold — see
+/// `soroban_forge_shared_utils::ttl`.
+///
+/// Thin wrapper over [`soroban_forge_shared_utils::bump_entry`] — the
+/// canonical helper (issue #127); the policy lives there.
 fn bump_entry(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+    shared_bump_entry(env, key);
 }
 
 /// Lifecycle events. The escrow id is a **topic** so indexers can filter
@@ -1112,6 +1176,16 @@ mod events {
     }
 
     #[contractevent]
+    pub struct ResolvedSplit {
+        #[topic]
+        pub escrow_id: u64,
+        pub data: EscrowData,
+        pub seller_bps: u32,
+        pub seller_share: i128,
+        pub buyer_share: i128,
+    }
+
+    #[contractevent]
     pub struct Cancelled {
         #[topic]
         pub escrow_id: u64,
@@ -1174,6 +1248,23 @@ mod events {
             escrow_id: escrow.escrow_id,
             data: escrow.clone(),
             in_favor_of_seller,
+        }
+        .publish(env);
+    }
+
+    pub fn resolved_split(
+        env: &Env,
+        escrow: &EscrowData,
+        seller_bps: u32,
+        seller_share: i128,
+        buyer_share: i128,
+    ) {
+        ResolvedSplit {
+            escrow_id: escrow.escrow_id,
+            data: escrow.clone(),
+            seller_bps,
+            seller_share,
+            buyer_share,
         }
         .publish(env);
     }

@@ -8,6 +8,7 @@ explicit table of unlock tranches.
 ```rust
 // linear (cliff + ramp)
 fn create_schedule(beneficiary, token, total_amount, cliff, duration) -> Result<u64, ForgeError>
+fn get_schedule(schedule_id) -> Result<VestingSchedule, ForgeError>
 // tranche (discrete unlock table)
 fn create_tranche_schedule(beneficiary, token, tranches: Vec<Tranche>) -> Result<u64, ForgeError>
 fn get_tranche_schedule(schedule_id) -> Result<TrancheSchedule, ForgeError>
@@ -24,6 +25,14 @@ timestamp recorded at creation) and `amount` is what unlocks there.
 Both kinds draw ids from one counter, so the id space is shared; the two
 records live under distinct storage keys and a linear id is `NotFound` in
 `get_tranche_schedule` (and vice versa).
+
+`get_schedule` is the linear kind's read-only record view: it returns the
+stored `VestingSchedule` (beneficiary, token, total amount, start, cliff,
+duration, claimed, stored status) for an existing id, mirroring
+`get_tranche_schedule` and the workspace's other record views (`get_escrow`,
+`get_tx`, `get_proposal`, `get_subscription`). `claimed` reflects completed
+claims; the stored `status` is refreshed on claim, and `get_status` derives
+the current one from ledger time between claims.
 
 ## Timing
 
@@ -102,7 +111,8 @@ revocation method.
 
 - `create_schedule` and `create_tranche_schedule` require the beneficiary.
 - `claim` requires the beneficiary.
-- `claimable`, `get_status`, and `get_tranche_schedule` are read-only views.
+- `claimable`, `get_status`, `get_schedule`, and `get_tranche_schedule` are
+  read-only views.
 
 ## Settlement
 

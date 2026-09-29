@@ -571,3 +571,132 @@ fn monotonic_id_counter_overflow_reported() {
         .unwrap();
     assert_eq!(err, ForgeError::ArithmeticOverflow);
 }
+
+// ---------------------------------------------------------------------------
+// `get_schedule` record view (issue #125)
+// ---------------------------------------------------------------------------
+
+/// The view returns the complete stored record for an existing id — every
+/// creation parameter round-trips, and the initial state matches what
+/// `claimable`/`get_status` read.
+#[test]
+fn get_schedule_returns_the_full_stored_record() {
+    let (_env, token, _tc, _cid, client, accounts) = setup!();
+    let id = client.create_schedule(&accounts.user1, &token, &TOTAL, &CLIFF, &DURATION);
+
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.beneficiary, accounts.user1);
+    assert_eq!(schedule.token, token);
+    assert_eq!(schedule.total_amount, TOTAL);
+    assert_eq!(schedule.start, START);
+    assert_eq!(schedule.cliff, CLIFF);
+    assert_eq!(schedule.duration, DURATION);
+    assert_eq!(schedule.claimed, 0);
+    assert_eq!(schedule.status, VestingStatus::Locked);
+    assert_eq!(client.claimable(&id), 0);
+    assert_eq!(client.get_status(&id), VestingStatus::Locked);
+}
+
+#[test]
+fn get_schedule_unknown_id_returns_not_found() {
+    let (_env, _token, _tc, _cid, client, _accounts) = setup!();
+    let err = client.try_get_schedule(&7_u64).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+}
+
+/// The two kinds partition one id space: a tranche id is `NotFound` in the
+/// linear view (and vice versa, per `get_tranche_schedule`).
+#[test]
+fn get_schedule_tranche_id_returns_not_found() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    let tranches = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            Tranche {
+                unlock_at: 0,
+                amount: 2_000,
+            },
+            Tranche {
+                unlock_at: 1_000,
+                amount: 8_000,
+            },
+        ],
+    );
+    let id = client.create_tranche_schedule(&accounts.user1, &token, &tranches);
+
+    let err = client.try_get_schedule(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+    // The tranche view does return that record.
+    let tranche = client.get_tranche_schedule(&id);
+    assert_eq!(tranche.total_amount, 10_000);
+}
+
+/// `claimed` in the record advances with completed claims: the view and the
+/// claim path read the same storage, and the stored status follows the
+/// settled state.
+#[test]
+fn get_schedule_reflects_claims() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+    assert_eq!(client.get_schedule(&id).claimed, 0);
+
+    // Halfway through the ramp: floor(TOTAL * 2_000 / 3_000) vests.
+    env.ledger().set_timestamp(START + CLIFF + DURATION / 2);
+    let payout = client.claim(&id);
+    assert_eq!(payout, 6_666);
+
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.claimed, 6_666);
+    assert_eq!(schedule.status, VestingStatus::Vesting);
+    assert_eq!(tc.balance(&accounts.user1), 6_666);
+    assert_eq!(tc.balance(&contract_id), TOTAL - 6_666);
+
+    // After the final claim the record is Completed with everything claimed.
+    env.ledger().set_timestamp(START + DURATION);
+    assert_eq!(client.claim(&id), TOTAL - 6_666);
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.claimed, TOTAL);
+    assert_eq!(schedule.status, VestingStatus::Completed);
+}
+
+/// The view is read-only: repeated reads return the same record and the id
+/// counter (the only cross-call state) never moves.
+#[test]
+fn get_schedule_is_read_only() {
+    let (env, token, _tc, contract_id, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+    let before = client.get_schedule(&id);
+    let count_before: u64 = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    });
+    assert_eq!(count_before, 1);
+
+    let again = client.get_schedule(&id);
+    assert_eq!(again.claimed, before.claimed);
+    assert_eq!(again.start, before.start);
+    assert_eq!(again.total_amount, before.total_amount);
+
+    let count_after: u64 = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    });
+    assert_eq!(count_after, count_before);
+
+    // A read against an empty id leaves nothing behind either.
+    let err = client.try_get_schedule(&99_u64).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+    let count_final: u64 = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    });
+    assert_eq!(count_final, count_before);
+}
+
+/// No authorization anywhere in the view's path: it succeeds under a blank
+/// envelope, like `claimable` and `get_status`.
+#[test]
+fn get_schedule_requires_no_auth() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+    env.set_auths(&[]);
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.beneficiary, accounts.user1);
+}
