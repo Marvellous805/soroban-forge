@@ -124,7 +124,7 @@ treasury at a terminal transition.
 | Metered overage pricing | ✅ Implemented | `base + Σ ceil(min(max(0, units - included), cap) / bucket) * price`, rounded up per bucket, derived per period from raw units so multi-period totals cannot drift; cap enforced by clamping (never rejecting) at settlement; an unrepresentable bill → `ArithmeticOverflow` before any transfer |
 | `cancel` | ✅ Implemented | Subscriber-authorized from `Active` / `Paused` / `PastDue`; rejects already-`Cancelled` |
 | `get_subscription` / `get_subscription_count` / `subscriptions_for_subscriber` / `subscriptions_for_provider` | ✅ Implemented | Read-only views; paged by `offset`/`limit` with `limit == 0` → `InvalidInput`; empty index yields an empty page, not an error |
-| Plan management | ❌ Not implemented | Follow-up |
+| Plan management | ✅ Implemented | `create_plan(provider, token, amount, period, quotas)` → `plan_id`; `subscribe_to_plan(plan_id, subscriber)` → `subscription_id`; `get_plan(plan_id)` → `Plan`; `plan_count()` → `u64`; plan ids from a separate monotonic counter; a subscriber may hold multiple subscriptions to the same plan (each a distinct record); plan quotas copied verbatim into the subscription on join |
 
 ## Marketplace Royalties (`crates/marketplace-royalties`)
 

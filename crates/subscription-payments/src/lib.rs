@@ -390,6 +390,76 @@ pub trait SorobanForgeSubscriptionPayments {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Subscription>, soroban_forge_shared_utils::ForgeError>;
+
+    // ─── Plan registry ───────────────────────────────────────────────────────
+
+    /// Publish a reusable billing plan.
+    ///
+    /// The provider calls this once; subscribers reference the returned
+    /// `plan_id` in [`subscribe_to_plan`] instead of repeating token, amount,
+    /// and period out-of-band. Plan ids are allocated from a separate
+    /// monotonic counter and are stable across calls.
+    ///
+    /// Requires the provider's authorization. `amount` and `period` must both
+    /// be positive; `quotas` (if non-empty) must pass the same validation as
+    /// [`set_quotas`] — at most [`MAX_QUOTAS`] unique metrics, `bucket_units
+    /// > 0`, `overage_price >= 0`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::InvalidInput`] — `amount <= 0`, `period == 0`, or a
+    ///   quota failed validation.
+    /// * [`ForgeError::Unauthorized`] — the caller is not `provider`.
+    fn create_plan(
+        env: Env,
+        provider: Address,
+        token: Address,
+        amount: i128,
+        period: u64,
+        quotas: soroban_sdk::Vec<MetricQuota>,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Subscribe `subscriber` to an existing plan by `plan_id`.
+    ///
+    /// Looks up the plan (returns [`ForgeError::NotFound`] for an unknown id),
+    /// and creates a subscription with the plan's token, amount, period, and
+    /// quotas. The returned subscription id is allocated from the **same**
+    /// counter as [`subscribe`] so all subscription ids are globally unique
+    /// regardless of creation path.
+    ///
+    /// A subscriber can hold multiple subscriptions to the same plan — each
+    /// call creates a distinct record with its own `subscription_id` and
+    /// independent `last_charged` / lifecycle. This mirrors the existing
+    /// behaviour of [`subscribe`], which also creates a new record on every
+    /// call even with the same provider.
+    ///
+    /// Requires the subscriber's authorization.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no plan with `plan_id` exists.
+    /// * [`ForgeError::Unauthorized`] — the caller is not `subscriber`.
+    fn subscribe_to_plan(
+        env: Env,
+        plan_id: u64,
+        subscriber: Address,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read a stored plan by id (read-only view; requires no authorization).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no plan with `plan_id` exists.
+    fn get_plan(
+        env: Env,
+        plan_id: u64,
+    ) -> Result<Plan, soroban_forge_shared_utils::ForgeError>;
+
+    /// Total number of plans created so far (read-only view).
+    ///
+    /// This is the monotonic plan id counter. It never decreases and equals
+    /// the highest plan id ever assigned.
+    fn plan_count(env: Env) -> u64;
 }
 
 /// Lifecycle state of a subscription.
@@ -404,6 +474,42 @@ pub enum SubscriptionStatus {
     PastDue,
     /// Temporarily paused; no charges can be made until resumed.
     Paused,
+}
+
+/// A reusable subscription plan published by a provider.
+///
+/// A plan captures the billing terms — token, amount, and period — that a
+/// provider publishes once and subscribers can reference by id. The plan's
+/// `quotas` field carries metered-usage pricing (an empty list is flat). The
+/// same `MetricQuota` type used on `Subscription` is embedded here so that
+/// joining a plan copies the declared terms verbatim into the subscription
+/// record, keeping the billing core independent of where the terms were
+/// published.
+///
+/// A subscriber can hold multiple subscriptions to the same plan. Each
+/// `subscribe_to_plan` call creates a distinct `Subscription` record with its
+/// own sequential id, `last_charged` timestamp, and independent lifecycle.
+/// This mirrors the existing behaviour of `subscribe`, where calling it twice
+/// with the same provider creates two distinct subscriptions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Plan {
+    /// Stable identifier assigned at creation. Allocated from a separate
+    /// counter (`DataKey::PlanCount`) so plan ids and subscription ids cannot
+    /// be confused.
+    pub plan_id: u64,
+    /// Provider that published and owns this plan.
+    pub provider: Address,
+    /// SEP-41 token contract used for settlement.
+    pub token: Address,
+    /// Fixed base amount charged per period (in the token's smallest unit).
+    pub amount: i128,
+    /// Length of one billing period, in seconds.
+    pub period: u64,
+    /// Per-metric usage quotas priced on top of `amount`. An empty list
+    /// represents flat pricing (no overage). Copied verbatim into the
+    /// `Subscription` record when a subscriber joins this plan.
+    pub quotas: Vec<MetricQuota>,
 }
 
 /// A recurring payment agreement.
@@ -501,6 +607,11 @@ enum DataKey {
     /// `record_usage`, removed by the charge that closes the period, read by
     /// the amount derivation.
     Usage(u64, Symbol),
+    /// The plan record for `u64` plan id.
+    Plan(u64),
+    /// Monotonic plan id counter (separate from subscription ids so the two
+    /// namespaces cannot be confused).
+    PlanCount,
 }
 
 /// The deployable subscription payments contract.
@@ -509,6 +620,81 @@ pub struct SubscriptionPayments;
 
 #[contractimpl]
 impl SubscriptionPayments {
+    // ─── Plan registry ───────────────────────────────────────────────────────
+
+    /// Publish a reusable billing plan and return its stable plan id.
+    ///
+    /// Validates before auth so invalid inputs surface without spending the
+    /// provider's signature. Plan ids are allocated from a separate monotonic
+    /// counter (`DataKey::PlanCount`) that is independent of subscription ids.
+    pub fn create_plan(
+        env: Env,
+        provider: Address,
+        token: Address,
+        amount: i128,
+        period: u64,
+        quotas: Vec<MetricQuota>,
+    ) -> Result<u64, ForgeError> {
+        if amount <= 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        if period == 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        validate_quotas(&quotas)?;
+        provider.require_auth();
+
+        let plan_id = Self::next_plan_id(&env)?;
+        let plan = Plan {
+            plan_id,
+            provider,
+            token,
+            amount,
+            period,
+            quotas,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Plan(plan_id), &plan);
+        Ok(plan_id)
+    }
+
+    /// Subscribe `subscriber` to an existing plan by `plan_id`.
+    ///
+    /// Looks up the plan, authorizes the subscriber, and creates a subscription
+    /// with the plan's terms. The subscription id is drawn from the same
+    /// monotonic counter as `subscribe`, so all subscription ids are globally
+    /// unique regardless of creation path.
+    pub fn subscribe_to_plan(env: Env, plan_id: u64, subscriber: Address) -> Result<u64, ForgeError> {
+        let plan = Self::get_plan_impl(&env, plan_id)?;
+        subscriber.require_auth();
+
+        Self::create_subscription(
+            &env,
+            subscriber,
+            plan.provider,
+            plan.token,
+            plan.amount,
+            plan.period,
+            plan.quotas,
+        )
+    }
+
+    /// Read a stored plan by id (read-only view; requires no authorization).
+    pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, ForgeError> {
+        Self::get_plan_impl(&env, plan_id)
+    }
+
+    /// Total number of plans created so far (read-only view).
+    pub fn plan_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlanCount)
+            .unwrap_or(0)
+    }
+
+    // ─── Subscription entrypoints ─────────────────────────────────────────────
+
     /// Create a new subscription and return its stable id.
     ///
     /// Requires `amount > 0` and `period > 0`. The subscriber is authorized at
@@ -529,7 +715,7 @@ impl SubscriptionPayments {
         }
         subscriber.require_auth();
 
-        Self::create_subscription(&env, subscriber, provider, token, amount, period)
+        Self::create_subscription(&env, subscriber, provider, token, amount, period, Vec::new(&env))
     }
 
     /// Explicitly authorize `provider` to create subscriptions on
@@ -612,7 +798,7 @@ impl SubscriptionPayments {
         }
         provider.require_auth();
 
-        Self::create_subscription(&env, subscriber, provider, token, amount, period)
+        Self::create_subscription(&env, subscriber, provider, token, amount, period, Vec::new(&env))
     }
 
     /// Bill one due period.
@@ -986,15 +1172,20 @@ impl SubscriptionPayments {
     }
 
     /// Create a new subscription through the single shared creation path used
-    /// by both `subscribe` and `subscribe_on_behalf_of`.
+    /// by `subscribe`, `subscribe_on_behalf_of`, and `subscribe_to_plan`.
     ///
     /// Callers must have completed validation and authorization; this helper
     /// allocates the id, writes the record, and appends both indexes. Index
     /// writes join the success path after every fallible step (validation,
     /// `require_auth`, id allocation), so they cannot observe or create
-    /// partial state. Records created through either entrypoint are
+    /// partial state. Records created through any entrypoint are
     /// indistinguishable from `get_subscription`'s perspective and draw
     /// from the same sequential counter.
+    ///
+    /// `quotas` is passed in by the caller so that `subscribe_to_plan` can
+    /// copy the plan's declared quotas verbatim into the new record, while
+    /// `subscribe` and `subscribe_on_behalf_of` pass an empty `Vec` for the
+    /// default flat flow.
     fn create_subscription(
         env: &Env,
         subscriber: Address,
@@ -1002,6 +1193,7 @@ impl SubscriptionPayments {
         token: Address,
         amount: i128,
         period: u64,
+        quotas: Vec<MetricQuota>,
     ) -> Result<u64, ForgeError> {
         let subscription_id = Self::next_id(env)?;
         let subscription = Subscription {
@@ -1015,10 +1207,7 @@ impl SubscriptionPayments {
             status: SubscriptionStatus::Active,
             paused_at: None,
             failed_attempts: 0,
-            // Flat by default: a subscription is metered only when the
-            // subscriber declares quotas (today via `set_quotas`, and later
-            // copied from the plan it joins).
-            quotas: Vec::new(env),
+            quotas,
         };
         env.storage()
             .instance()
@@ -1044,10 +1233,29 @@ impl SubscriptionPayments {
         Ok(id)
     }
 
+    /// Allocate the next monotonic plan id from the separate plan counter.
+    fn next_plan_id(env: &Env) -> Result<u64, ForgeError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlanCount)
+            .unwrap_or(0);
+        let id = count.checked_add(1).ok_or(ForgeError::ArithmeticOverflow)?;
+        env.storage().instance().set(&DataKey::PlanCount, &id);
+        Ok(id)
+    }
+
     fn get_subscription_impl(env: &Env, subscription_id: u64) -> Result<Subscription, ForgeError> {
         env.storage()
             .instance()
             .get(&DataKey::Subscription(subscription_id))
+            .ok_or(ForgeError::NotFound)
+    }
+
+    fn get_plan_impl(env: &Env, plan_id: u64) -> Result<Plan, ForgeError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Plan(plan_id))
             .ok_or(ForgeError::NotFound)
     }
 
@@ -1368,6 +1576,8 @@ mod authz;
 mod metering;
 #[cfg(test)]
 mod props;
+#[cfg(test)]
+mod plan;
 
 #[cfg(test)]
 mod tests {
