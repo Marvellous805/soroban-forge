@@ -143,22 +143,7 @@ use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
 };
 
-use soroban_forge_shared_utils::ForgeError;
-
-/// Ledger-time constants for TTL bumps.
-///
-/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
-/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
-/// is how close to expiry an entry must be before a bump applies. The
-/// 30-day horizon comfortably covers a funded escrow between keeper
-/// touches.
-mod ttl {
-    pub const DAY_IN_LEDGERS: u32 = 17_280;
-    /// Lifetime applied on every TTL touch.
-    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-    /// Bump only when the entry is within this window of expiring.
-    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-}
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 
 /// Public interface for the Soroban Forge escrow contract.
 #[contractclient(name = "SorobanForgeEscrowClient")]
@@ -340,8 +325,9 @@ pub trait SorobanForgeEscrow {
     ) -> ParticipantEscrowsPage;
 
     /// Permissionless TTL keeper: bumps the escrow entry's TTL to the
-    /// [`ttl::BUMP_AMOUNT`] horizon when it falls inside
-    /// [`ttl::BUMP_THRESHOLD`]. Call periodically for escrows that must
+    /// [`soroban_forge_shared_utils::ttl::BUMP_AMOUNT`] horizon when it
+    /// falls inside [`soroban_forge_shared_utils::ttl::BUMP_THRESHOLD`].
+    /// Call periodically for escrows that must
     /// outlive their entry's current TTL. Costs fees; changes nothing
     /// else.
     ///
@@ -1097,13 +1083,14 @@ fn split_amount(amount: i128, seller_bps: u32) -> Result<(i128, i128), ForgeErro
     Ok((seller_share, buyer_share))
 }
 
-/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
-/// it falls inside [`ttl::BUMP_THRESHOLD`]. The standard threshold/extend
-/// pattern: cheap no-op while the entry is fresh, decisive near expiry.
+/// Bump a persistent entry's TTL to the workspace policy's 30-day horizon
+/// when it falls inside its one-day threshold — see
+/// `soroban_forge_shared_utils::ttl`.
+///
+/// Thin wrapper over [`soroban_forge_shared_utils::bump_entry`] — the
+/// canonical helper (issue #127); the policy lives there.
 fn bump_entry(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+    shared_bump_entry(env, key);
 }
 
 /// Lifecycle events. The escrow id is a **topic** so indexers can filter

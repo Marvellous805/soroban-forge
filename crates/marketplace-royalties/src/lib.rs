@@ -66,7 +66,7 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env,
 };
@@ -164,6 +164,34 @@ pub trait SorobanForgeMarketplaceRoyalties {
         collection: Address,
     ) -> Result<SettlementSummary, soroban_forge_shared_utils::ForgeError>;
 
+    /// Quote the exact split a settlement of `amount` for `collection`
+    /// would apply (read-only view).
+    ///
+    /// Returns the contract's own derivation — [`SaleQuote`] carries the
+    /// effective royalty rate, its share of `amount`, and the seller's net
+    /// — so integrators can display "you will pay X, royalty is Y, seller
+    /// receives Z" without re-implementing the basis-point math off-chain.
+    /// A quote and the settlement it describes cannot disagree: the same
+    /// `effective_bps` and `split` resolution the
+    /// settlement entrypoints run produces the quote's numbers, rounding
+    /// included.
+    ///
+    /// No storage mutation, no authorization, no events.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no royalty configuration for this
+    ///   collection (exactly what the settlement entrypoints return).
+    /// * [`ForgeError::InvalidInput`] — `amount <= 0` (mirrors
+    ///   `distribute`'s and `settle_sale`'s validation).
+    /// * [`ForgeError::ArithmeticOverflow`] — the split math overflowed,
+    ///   as it would at settlement time.
+    fn quote_sale(
+        env: Env,
+        collection: Address,
+        amount: i128,
+    ) -> Result<SaleQuote, soroban_forge_shared_utils::ForgeError>;
+
     /// Permissionless keeper entrypoint: extend the persistent storage TTL of a collection's royalty configuration and settlement summary.
     ///
     /// # Errors
@@ -223,27 +251,39 @@ pub struct SettlementSummary {
     pub royalties_paid: i128,
 }
 
-/// Persistent storage TTL constants.
+/// The split one sale of a collection would apply at settlement time, as
+/// returned by [`MarketplaceRoyalties::quote_sale`].
 ///
-/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
-/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
-/// is how close to expiry an entry must be before a bump applies. The
-/// 30-day horizon comfortably covers a royalty configuration between keeper
-/// touches.
-mod ttl {
-    pub const DAY_IN_LEDGERS: u32 = 17_280;
-    /// Lifetime applied on every TTL touch.
-    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-    /// Bump only when the entry is within this window of expiring.
-    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+/// Per-sale counterpart of [`SettlementSummary`]: where the summary
+/// accumulates what *was* settled, a quote derives what one settlement
+/// *would* move. `royalty_amount + seller_net == gross` exactly — the
+/// floor-rounding remainder stays with the seller, as in every settled
+/// sale.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SaleQuote {
+    /// The sale amount the quote was computed for.
+    pub gross: i128,
+    /// Effective royalty rate applied, in basis points. Zero for a
+    /// `Disabled` configuration — matching `settle_sale`, which settles
+    /// such a sale in full to the seller.
+    pub royalty_bps: u32,
+    /// Royalty share: `gross * royalty_bps / 10_000`, floored — the exact
+    /// amount a settlement would transfer to the configured recipient.
+    pub royalty_amount: i128,
+    /// Seller's net: `gross - royalty_amount` — the exact amount a
+    /// settlement would transfer to the seller.
+    pub seller_net: i128,
 }
 
-/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
-/// it falls inside [`ttl::BUMP_THRESHOLD`].
+/// Bump a persistent entry's TTL to the workspace policy's 30-day horizon
+/// when it falls inside its one-day threshold — see
+/// `soroban_forge_shared_utils::ttl`.
+///
+/// Thin wrapper over [`soroban_forge_shared_utils::bump_entry`] — the
+/// canonical helper (issue #127); the policy lives there.
 fn bump_entry(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+    shared_bump_entry(env, key);
 }
 
 /// Persistent-storage keys.
@@ -295,7 +335,7 @@ impl MarketplaceRoyalties {
     /// Requires the collection's authorization (the payer's authorization
     /// covers the nested token transfer, exactly as `settle_sale`) and
     /// `amount > 0`. Computes the split with
-    /// [`split`] — the same math as `settle_sale` — then transfers only the
+    /// `split` — the same math as `settle_sale` — then transfers only the
     /// royalty share from `payer` to the configured recipient **before any
     /// settlement state is committed**. The `seller`'s net is *not*
     /// transferred here: this is a standalone royalty settlement for cases
@@ -551,6 +591,43 @@ impl MarketplaceRoyalties {
             .persistent()
             .get(&DataKey::Summary(collection))
             .ok_or(ForgeError::NotFound)
+    }
+
+    /// Quote the exact split a settlement of `amount` for `collection`
+    /// would apply (read-only view).
+    ///
+    /// Settle-parity: the quote runs the same validation order and the same
+    /// split derivation as the settlement entrypoints — configuration load
+    /// (`NotFound`), `amount > 0` (`InvalidInput`, mirroring
+    /// `distribute`/`settle_sale`), then `effective_bps` + `split` —
+    /// so the quote never succeeds where `settle_sale` would fail, and the
+    /// returned numbers are the settlement's own, rounding included. A
+    /// `Disabled` configuration quotes at zero bps, matching `settle_sale`'s
+    /// settle-in-full behavior. No storage mutation, no authorization, no
+    /// events.
+    pub fn quote_sale(
+        env: Env,
+        collection: Address,
+        amount: i128,
+    ) -> Result<SaleQuote, ForgeError> {
+        let royalty: Royalty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Royalty(collection.clone()))
+            .ok_or(ForgeError::NotFound)?;
+        if amount <= 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        // The same resolution the settlement entrypoints run — there is no
+        // second derivation to drift from.
+        let royalty_bps = effective_bps(&royalty);
+        let (royalty_amount, seller_net) = split(amount, royalty_bps)?;
+        Ok(SaleQuote {
+            gross: amount,
+            royalty_bps,
+            royalty_amount,
+            seller_net,
+        })
     }
 
     /// Permissionless keeper: bump the royalty and summary entries' TTL without changing
@@ -1778,5 +1855,172 @@ mod tests {
 
         let events = env.events().all();
         assert!(!events.events().is_empty());
+    }
+
+    /// The quote is the settlement's own math: quoting a sale and then
+    /// settling it returns identical numbers, floor rounding included
+    /// (1,030 at 500 bps floors the 51.5 royalty share to 51).
+    #[test]
+    fn quote_matches_settle_sale_output_including_floor_rounding() {
+        let (_env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        // The fixture mints 1,000 to the payer; the sale below is larger.
+        StellarAssetClient::new(&_env, &token).mint(&accounts.user1, &2_000_i128);
+
+        let quote = client.quote_sale(collection, &1_030_i128);
+        assert_eq!(quote.gross, 1_030);
+        assert_eq!(quote.royalty_bps, 500);
+        assert_eq!(quote.royalty_amount, 51);
+        assert_eq!(quote.seller_net, 979);
+        assert_eq!(quote.royalty_amount + quote.seller_net, quote.gross);
+
+        let settlement = client.settle_sale(
+            collection,
+            &token,
+            &accounts.user1,
+            &accounts.user3,
+            &1_030_i128,
+        );
+        assert_eq!(settlement.royalty_share, quote.royalty_amount);
+        assert_eq!(settlement.seller_net, quote.seller_net);
+    }
+
+    /// Across the basis-point spectrum the quote equals the settled split
+    /// exactly, and the parts always sum to the gross: zero bps, max bps,
+    /// and amounts that floor a remainder onto the seller.
+    #[test]
+    fn quote_matches_settlement_math_across_bps_boundaries() {
+        let (_env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        // Six settlements of 1,234 run below; the fixture mints only 1,000.
+        StellarAssetClient::new(&_env, &token).mint(&accounts.user1, &10_000_i128);
+
+        for bps in [0_u32, 1, 500, 4_321, 9_999, 10_000] {
+            client.set_royalty(collection, &accounts.user2, &bps);
+            let quote = client.quote_sale(collection, &1_234_i128);
+            let (royalty_share, seller_net) =
+                split(1_234, effective_bps(&client.get_royalty(collection))).unwrap();
+            assert_eq!(quote.royalty_bps, bps);
+            assert_eq!(quote.royalty_amount, royalty_share, "bps: {bps}");
+            assert_eq!(quote.seller_net, seller_net, "bps: {bps}");
+            assert_eq!(quote.royalty_amount + quote.seller_net, 1_234);
+
+            let settlement = client.settle_sale(
+                collection,
+                &token,
+                &accounts.user1,
+                &accounts.user3,
+                &1_234_i128,
+            );
+            assert_eq!(settlement.royalty_share, quote.royalty_amount, "bps: {bps}");
+            assert_eq!(settlement.seller_net, quote.seller_net, "bps: {bps}");
+        }
+    }
+
+    #[test]
+    fn quote_zero_bps_quotes_the_full_amount_to_the_seller() {
+        let (_env, client, accounts) = setup!();
+        client.set_royalty(&accounts.arbiter, &accounts.user2, &0_u32);
+        let quote = client.quote_sale(&accounts.arbiter, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 0);
+        assert_eq!(quote.royalty_amount, 0);
+        assert_eq!(quote.seller_net, 1_000);
+    }
+
+    #[test]
+    fn quote_max_bps_quotes_the_full_amount_to_the_recipient() {
+        let (_env, client, accounts) = setup!();
+        client.set_royalty(&accounts.arbiter, &accounts.user2, &10_000_u32);
+        let quote = client.quote_sale(&accounts.arbiter, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 10_000);
+        assert_eq!(quote.royalty_amount, 1_000);
+        assert_eq!(quote.seller_net, 0);
+    }
+
+    #[test]
+    fn quote_unregistered_collection_returns_not_found() {
+        let (env, client, _accounts) = setup!();
+        let unknown = Address::generate(&env);
+        let err = client
+            .try_quote_sale(&unknown, &1_000_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn quote_rejects_non_positive_amount() {
+        let (_env, client, accounts) = setup!();
+        for amount in [0_i128, -5] {
+            let err = client
+                .try_quote_sale(&accounts.arbiter, &amount)
+                .unwrap_err()
+                .unwrap();
+            assert_eq!(err, ForgeError::InvalidInput);
+        }
+    }
+
+    /// Settle-parity for the disabled state: `settle_sale` settles a
+    /// `Disabled` configuration in full to the seller (effective bps zero),
+    /// so the quote must succeed the same way — never error where the
+    /// settlement succeeds.
+    #[test]
+    fn quote_disabled_collection_quotes_at_zero_bps_like_settle_sale() {
+        let (env, token, _tc, contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+
+        // Same gap as the settle suite: `set_royalty` has no public
+        // "disable" switch, so write the `Disabled` record directly.
+        let disabled = Royalty {
+            collection: collection.clone(),
+            recipient: accounts.user2.clone(),
+            bps: 500,
+            status: RoyaltyStatus::Disabled,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Royalty(collection.clone()), &disabled);
+        });
+
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 0);
+        assert_eq!(quote.royalty_amount, 0);
+        assert_eq!(quote.seller_net, 1_000);
+
+        let settlement = client.settle_sale(
+            collection,
+            &token,
+            &accounts.user1,
+            &accounts.user3,
+            &1_000_i128,
+        );
+        assert_eq!(settlement.royalty_share, quote.royalty_amount);
+        assert_eq!(settlement.seller_net, quote.seller_net);
+    }
+
+    /// A quote is a pure view: it succeeds with no authorization envelope
+    /// at all, moves no balances, and emits no events.
+    #[test]
+    fn quote_requires_no_auth_and_writes_nothing() {
+        let (env, _token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        let payer = &accounts.user1;
+        let seller = &accounts.user3;
+        let recipient = &accounts.user2;
+
+        let balances_before = (tc.balance(payer), tc.balance(seller), tc.balance(recipient));
+
+        // Blank envelope: every `require_auth` would abort (the same
+        // fixture the authz suites use) — the quote must not need one.
+        env.set_auths(&[]);
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.royalty_amount, 50);
+        assert_eq!(quote.seller_net, 950);
+
+        assert_eq!(tc.balance(payer), balances_before.0);
+        assert_eq!(tc.balance(seller), balances_before.1);
+        assert_eq!(tc.balance(recipient), balances_before.2);
+        assert!(env.events().all().events().is_empty());
     }
 }
