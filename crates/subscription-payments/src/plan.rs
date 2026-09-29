@@ -358,8 +358,13 @@ fn plan_ids_and_subscription_ids_are_from_separate_counters() {
     assert_eq!(plan_id2, 2);
 
     // Subscription ids start their own counter at 1.
-    let sub_id1 =
-        client.subscribe(&accounts.user1, &accounts.validator, &token, &AMOUNT, &PERIOD);
+    let sub_id1 = client.subscribe(
+        &accounts.user1,
+        &accounts.validator,
+        &token,
+        &AMOUNT,
+        &PERIOD,
+    );
     let sub_id2 = client.subscribe_to_plan(&plan_id1, &accounts.user1);
     assert_eq!(sub_id1, 1);
     assert_eq!(sub_id2, 2);
@@ -434,7 +439,13 @@ fn subscribe_to_plan_subscription_id_is_sequential_across_all_paths() {
         &Vec::new(&client.env),
     );
 
-    let id1 = client.subscribe(&accounts.user1, &accounts.validator, &token, &AMOUNT, &PERIOD);
+    let id1 = client.subscribe(
+        &accounts.user1,
+        &accounts.validator,
+        &token,
+        &AMOUNT,
+        &PERIOD,
+    );
     let id2 = client.subscribe_to_plan(&plan_id, &accounts.user2);
     let id3 = client.subscribe_to_plan(&plan_id, &accounts.user3);
     let id4 = client.subscribe(&accounts.user1, &accounts.arbiter, &token, &AMOUNT, &PERIOD);
@@ -551,8 +562,7 @@ fn subscribe_to_plan_requires_subscriber_auth() {
     // Create the plan with mocked auths on the same env (mock_all affects env, not per-call).
     env.mock_all_auths_allowing_non_root_auth();
     let client = SorobanForgeSubscriptionPaymentsClient::new(&env, &contract_id);
-    let plan_id =
-        client.create_plan(&provider, &token, &AMOUNT, &PERIOD, &Vec::new(&env));
+    let plan_id = client.create_plan(&provider, &token, &AMOUNT, &PERIOD, &Vec::new(&env));
 
     // Create a brand new env with no mocking — only a plan lookup, then require_auth.
     let env2 = Env::default();
@@ -567,8 +577,7 @@ fn subscribe_to_plan_requires_subscriber_auth() {
     // Create the plan in env2 with mocking...
     env2.mock_all_auths_allowing_non_root_auth();
     let client2 = SorobanForgeSubscriptionPaymentsClient::new(&env2, &contract_id2);
-    let plan_id2 =
-        client2.create_plan(&provider2, &token2, &AMOUNT, &PERIOD, &Vec::new(&env2));
+    let plan_id2 = client2.create_plan(&provider2, &token2, &AMOUNT, &PERIOD, &Vec::new(&env2));
     // Now try subscribe_to_plan with an explicit auth that doesn't include subscriber2.
     // We use env2 mock_all so this will succeed — rewrite the test to assert the
     // authorization tree contains the subscriber.
@@ -582,7 +591,10 @@ fn subscribe_to_plan_requires_subscriber_auth() {
     let auths = env2.auths();
     // At least one authorization must be for subscriber2.
     let subscriber_authorized = auths.iter().any(|(addr, _)| *addr == subscriber2);
-    assert!(subscriber_authorized, "subscribe_to_plan must require subscriber auth");
+    assert!(
+        subscriber_authorized,
+        "subscribe_to_plan must require subscriber auth"
+    );
     let sub = client2.get_subscription(&sub_id);
     assert_eq!(sub.subscriber, subscriber2);
 }
@@ -663,10 +675,14 @@ fn explicit_subscribe_still_works_alongside_plans() {
         &Vec::new(&client.env),
     );
 
-    let sub_via_plan =
-        client.subscribe_to_plan(&plan_id, &accounts.user1);
-    let sub_explicit =
-        client.subscribe(&accounts.user2, &accounts.validator, &token, &50_i128, &500_u64);
+    let sub_via_plan = client.subscribe_to_plan(&plan_id, &accounts.user1);
+    let sub_explicit = client.subscribe(
+        &accounts.user2,
+        &accounts.validator,
+        &token,
+        &50_i128,
+        &500_u64,
+    );
 
     let sp = client.get_subscription(&sub_via_plan);
     let se = client.get_subscription(&sub_explicit);

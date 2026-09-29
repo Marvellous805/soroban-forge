@@ -471,10 +471,7 @@ pub trait SorobanForgeSubscriptionPayments {
     /// # Errors
     ///
     /// * [`ForgeError::NotFound`] — no plan with `plan_id` exists.
-    fn get_plan(
-        env: Env,
-        plan_id: u64,
-    ) -> Result<Plan, soroban_forge_shared_utils::ForgeError>;
+    fn get_plan(env: Env, plan_id: u64) -> Result<Plan, soroban_forge_shared_utils::ForgeError>;
 
     /// Total number of plans created so far (read-only view).
     ///
@@ -680,9 +677,7 @@ impl SubscriptionPayments {
             period,
             quotas,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Plan(plan_id), &plan);
+        env.storage().instance().set(&DataKey::Plan(plan_id), &plan);
         Ok(plan_id)
     }
 
@@ -692,7 +687,11 @@ impl SubscriptionPayments {
     /// with the plan's terms. The subscription id is drawn from the same
     /// monotonic counter as `subscribe`, so all subscription ids are globally
     /// unique regardless of creation path.
-    pub fn subscribe_to_plan(env: Env, plan_id: u64, subscriber: Address) -> Result<u64, ForgeError> {
+    pub fn subscribe_to_plan(
+        env: Env,
+        plan_id: u64,
+        subscriber: Address,
+    ) -> Result<u64, ForgeError> {
         let plan = Self::get_plan_impl(&env, plan_id)?;
         subscriber.require_auth();
 
@@ -739,10 +738,17 @@ impl SubscriptionPayments {
         }
         if period == 0 {
             return Err(ForgeError::InvalidInput);
-        }
-        subscriber.require_auth();
+        }        subscriber.require_auth();
 
-        Self::create_subscription(&env, subscriber, provider, token, amount, period, Vec::new(&env))
+        Self::create_subscription(
+            &env,
+            subscriber,
+            provider,
+            token,
+            amount,
+            period,
+            Vec::new(&env),
+        )
     }
 
     /// Explicitly authorize `provider` to create subscriptions on
@@ -822,10 +828,17 @@ impl SubscriptionPayments {
         // subscriber funds.
         if !Self::is_provider_authorized_impl(&env, &subscriber, &provider) {
             return Err(ForgeError::Unauthorized);
-        }
-        provider.require_auth();
+        }        provider.require_auth();
 
-        Self::create_subscription(&env, subscriber, provider, token, amount, period, Vec::new(&env))
+        Self::create_subscription(
+            &env,
+            subscriber,
+            provider,
+            token,
+            amount,
+            period,
+            Vec::new(&env),
+        )
     }
 
     /// Bill one due period.
@@ -1638,9 +1651,9 @@ mod authz;
 #[cfg(test)]
 mod metering;
 #[cfg(test)]
-mod props;
-#[cfg(test)]
 mod plan;
+#[cfg(test)]
+mod props;
 
 #[cfg(test)]
 mod tests {
@@ -2179,24 +2192,24 @@ mod tests {
         let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
         let expected = START + PERIOD;
         assert_eq!(client.next_charge_due(&subscription_id), expected);
-        
+
         // Mutate-check
         let before = client.get_subscription(&subscription_id);
         client.next_charge_due(&subscription_id);
         let after = client.get_subscription(&subscription_id);
         assert_eq!(before.last_charged, after.last_charged);
-        
+
         // Stable across before-due time
         env.ledger().set_timestamp(START + PERIOD - 1);
         assert_eq!(client.charge(&subscription_id), 0);
         assert_eq!(client.next_charge_due(&subscription_id), expected);
-        
+
         // Advances exactly by one period after a charge
         env.ledger().set_timestamp(START + PERIOD);
         client.charge(&subscription_id);
         assert_eq!(client.next_charge_due(&subscription_id), expected + PERIOD);
     }
-    
+
     #[test]
     fn next_charge_due_missing_subscription_is_not_found() {
         let (_env, _token, _tc, _contract_id, client, _accounts, _id) = setup!();
@@ -2303,7 +2316,7 @@ mod tests {
     #[test]
     fn due_periods_tracks_elapsed_time_correctly() {
         let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
-        
+
         // Before a period elapses
         env.ledger().set_timestamp(START + PERIOD - 1);
         assert_eq!(client.due_periods(&subscription_id), 0);
@@ -2323,7 +2336,7 @@ mod tests {
         let err = client.try_due_periods(&999).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::NotFound);
     }
-    
+
     #[test]
     fn due_periods_cancelled_does_not_panic() {
         let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();

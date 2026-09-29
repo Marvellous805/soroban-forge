@@ -84,7 +84,7 @@ impl<'a> TokenFixture<'a> {
         let address = sac.address();
         let admin = StellarAssetClient::new(env, &address);
         let client = TokenClient::new(env, &address);
-        
+
         Self {
             address,
             admin,
@@ -113,7 +113,7 @@ mod tests {
         env.mock_all_auths();
         let accounts = TestAccounts::generate(&env);
         let token = TokenFixture::new(&env);
-        
+
         assert_eq!(token.balance(&accounts.user1), 0);
         token.mint(&accounts.user1, &1000);
         assert_eq!(token.balance(&accounts.user1), 1000);
@@ -126,7 +126,7 @@ mod tests {
         let accounts = TestAccounts::generate(&env);
         let token1 = TokenFixture::new(&env);
         let token2 = TokenFixture::new(&env);
-        
+
         token1.mint(&accounts.user1, &500);
         assert_eq!(token1.balance(&accounts.user1), 500);
         assert_eq!(token2.balance(&accounts.user1), 0);

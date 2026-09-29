@@ -647,7 +647,6 @@ struct BasketWorld {
     arbiter: Address,
 }
 
-fn setup_basket_world(mint_b: bool) -> BasketWorld {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -756,7 +755,7 @@ struct MultiPartyWorld {
     outsider: Address,
 }
 
-fn setup_multi_party_world() -> MultiPartyWorld {
+fn setup_basket_world(mint_b: bool) -> BasketWorld {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(START);
@@ -1124,6 +1123,15 @@ proptest! {
         prop_assert_eq!(page.total, 2, "seller/arbiter index holds both records once each");
         prop_assert_eq!(page.ids.get_unchecked(0), single);
         prop_assert_eq!(page.ids.get_unchecked(1), basket);
+    }
+}
+
+fn setup_multi_party_world() -> MultiPartyWorld {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+
+    let admin = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(admin);
     let token = sac.address();
     let escrow = env.register(Escrow, ());

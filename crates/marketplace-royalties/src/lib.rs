@@ -1264,7 +1264,7 @@ mod tests {
         let (_env, client, accounts) = setup!();
         let token_id = 42_u64;
         // accounts.validator has no collection config
-        
+
         client.set_token_royalty(&accounts.validator, &token_id, &accounts.user3, &1_000_u32);
 
         // The override is stored and readable even without a collection config
