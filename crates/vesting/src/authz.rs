@@ -357,3 +357,95 @@ fn blank_envelope_aborts_claim_and_preserves_custody() {
     assert_eq!(tc.balance(&contract_id), TOTAL);
     assert_eq!(client.get_status(&id), VestingStatus::Vesting);
 }
+
+use crate::Tranche;
+
+// --- Tranche Authorization & Replay Tests ---
+
+#[test]
+fn create_tranche_schedule_rejects_signature_from_non_beneficiary_tranche() {
+    let (env, _, token, _, client, _) = setup!();
+    let beneficiary = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let mut tranches = soroban_sdk::Vec::new(&env);
+    tranches.push_back(Tranche {
+        unlock_at: 100,
+        amount: 1000,
+    });
+
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_tranche_schedule",
+                args: (&beneficiary, &token.address, &tranches).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_tranche_schedule(&beneficiary, &token.address, &tranches);
+
+    assert!(res.is_err());
+}
+
+#[test]
+fn create_tranche_schedule_rejects_args_replay_with_different_table() {
+    let (env, _, token, _, client, _) = setup!();
+    let beneficiary = Address::generate(&env);
+
+    let mut tranches_a = soroban_sdk::Vec::new(&env);
+    tranches_a.push_back(Tranche {
+        unlock_at: 100,
+        amount: 1000,
+    });
+
+    let mut tranches_b = soroban_sdk::Vec::new(&env);
+    tranches_b.push_back(Tranche {
+        unlock_at: 100,
+        amount: 9000,
+    });
+
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &beneficiary,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_tranche_schedule",
+                args: (&beneficiary, &token.address, &tranches_a).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_tranche_schedule(&beneficiary, &token.address, &tranches_b);
+
+    assert!(res.is_err());
+}
+
+#[test]
+fn claim_tranche_authorization_tree_is_beneficiary_root_entrypoint() {
+    let (env, _, token, _, client, _) = setup!();
+    let beneficiary = Address::generate(&env);
+
+    let mut tranches = soroban_sdk::Vec::new(&env);
+    tranches.push_back(Tranche {
+        unlock_at: 100,
+        amount: 1000,
+    });
+
+    env.mock_all_auths();
+    let id = client.create_tranche_schedule(&beneficiary, &token.address, &tranches);
+    env.ledger().set_timestamp(START + 200);
+
+    env.mock_auths(&[MockAuth {
+        address: &beneficiary,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "claim",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let claimed = client.claim(&id);
+    assert_eq!(claimed, 1000);
+}
