@@ -23,6 +23,7 @@ use crate::{
     BasketEscrowData, Escrow, EscrowAsset, EscrowData, EscrowStatus, SorobanForgeEscrowClient,
 };
 use soroban_forge_shared_utils::ForgeError;
+use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::{Address, Env, Vec};
@@ -893,6 +894,36 @@ fn touch_ttl_extends_and_keeps_state_intact() {
     client.touch_ttl(&id);
 
     assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn ttl_info_tracks_remaining_ledgers_and_touch_ttl() {
+    let (env, token, _tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let initial = client.ttl_info(&id);
+    assert!(initial > 0 && initial <= crate::ttl::BUMP_AMOUNT);
+
+    // The read-only view agrees with the host test utility's actual TTL.
+    let key = crate::DataKey::Escrow(id);
+    let host_ttl = env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
+    assert_eq!(initial, host_ttl);
+
+    env.ledger()
+        .set_sequence_number(crate::ttl::BUMP_THRESHOLD + 100);
+    let near_expiry = client.ttl_info(&id);
+    assert!(near_expiry <= crate::ttl::BUMP_THRESHOLD);
+    client.touch_ttl(&id);
+    assert_eq!(client.ttl_info(&id), crate::ttl::BUMP_AMOUNT);
+}
+
+#[test]
+fn ttl_info_missing_entry_is_not_found() {
+    let (_env, _token, _tc, _contract_id, client, _accounts) = setup!();
+    assert_eq!(
+        client.try_ttl_info(&999).unwrap_err().unwrap(),
+        ForgeError::NotFound
+    );
 }
 
 // -----------------------------------------------------------------------

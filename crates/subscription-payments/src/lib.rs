@@ -481,6 +481,12 @@ pub trait SorobanForgeSubscriptionPayments {
     fn plan_count(env: Env) -> u64;
 }
 
+mod ttl {
+    pub const DAY_IN_LEDGERS: u32 = 17_280;
+    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+}
+
 /// Lifecycle state of a subscription.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -891,9 +897,7 @@ impl SubscriptionPayments {
                 } else {
                     subscription.status = SubscriptionStatus::PastDue;
                 }
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &subscription);
+                Self::store_subscription(&env, subscription_id, &subscription);
                 Ok(0)
             }
         }
@@ -957,9 +961,7 @@ impl SubscriptionPayments {
             subscription.failed_attempts = 0;
             subscription.status = SubscriptionStatus::Active;
             subscription.paused_at = None;
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &subscription);
+            Self::store_subscription(&env, subscription_id, &subscription);
         }
         Ok(total)
     }
@@ -1073,9 +1075,7 @@ impl SubscriptionPayments {
 
         subscription.status = SubscriptionStatus::Paused;
         subscription.paused_at = Some(env.ledger().timestamp());
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         Ok(())
     }
 
@@ -1102,9 +1102,7 @@ impl SubscriptionPayments {
             .ok_or(ForgeError::ArithmeticOverflow)?;
         subscription.status = SubscriptionStatus::Active;
         subscription.paused_at = None;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         Ok(())
     }
 
@@ -1121,9 +1119,7 @@ impl SubscriptionPayments {
 
         subscription.status = SubscriptionStatus::Cancelled;
         subscription.paused_at = None;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+        Self::store_subscription(&env, subscription_id, &subscription);
         events::cancelled(&env, &subscription);
         Ok(())
     }
@@ -1284,7 +1280,7 @@ impl SubscriptionPayments {
 
     fn get_subscription_impl(env: &Env, subscription_id: u64) -> Result<Subscription, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Subscription(subscription_id))
             .ok_or(ForgeError::NotFound)
     }
@@ -1620,6 +1616,7 @@ mod plan;
 mod tests {
     use super::*;
     use soroban_forge_test_utils::TestAccounts;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::{Address, Env};
@@ -2612,5 +2609,42 @@ mod tests {
 
         let sub = client.get_subscription(&subscription_id);
         assert_eq!(sub.last_charged, START + PERIOD * 2);
+    }
+
+    #[test]
+    fn persistent_record_and_touch_ttl_are_available() {
+        let (env, _token, _tc, contract_id, client, _accounts, subscription_id) = setup!();
+        let key = DataKey::Subscription(subscription_id);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        assert_eq!(
+            client.get_subscription(&subscription_id).subscription_id,
+            subscription_id
+        );
+        env.ledger().set_timestamp(START + PERIOD);
+        assert_eq!(client.charge(&subscription_id), AMOUNT);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        client.cancel(&subscription_id);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+        env.ledger().set_sequence_number(ttl::BUMP_THRESHOLD + 100);
+        assert_eq!(client.touch_ttl(&subscription_id), ());
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key))
+                > ttl::BUMP_THRESHOLD
+        );
+
+        let err = client.try_touch_ttl(&u64::MAX).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
     }
 }

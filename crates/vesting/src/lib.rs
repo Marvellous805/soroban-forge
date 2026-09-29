@@ -530,6 +530,13 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(schedule_id), &schedule);
+        events::claimed(
+            env,
+            schedule_id,
+            amount,
+            schedule.claimed,
+            schedule.status.clone(),
+        );
         Ok(amount)
     }
 
@@ -554,6 +561,13 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::TrancheSchedule(schedule_id), &schedule);
+        events::claimed(
+            env,
+            schedule_id,
+            amount,
+            schedule.claimed,
+            schedule.status.clone(),
+        );
         Ok(amount)
     }
 

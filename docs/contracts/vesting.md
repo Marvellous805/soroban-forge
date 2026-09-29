@@ -116,6 +116,17 @@ revocation method.
 
 ## Settlement
 
+## Events
+
+`create_schedule` publishes one `ScheduleCreated` event after storing the
+linear schedule. Its `schedule_id` is the topic and the complete
+`VestingSchedule` is the payload. A successful non-zero `claim` publishes one
+`Claimed` event after the updated record is stored; the event carries the
+schedule id, payout amount, cumulative claimed amount, and resulting status.
+Claims for both linear and tranche schedules are reported. A claim returning
+zero, read-only calls, and failed invocations publish no vesting lifecycle
+event.
+
 The contract custodies the SEP-41 token configured on the schedule, and
 `claim` settles through it for both kinds:
 

@@ -60,6 +60,7 @@ treasury at a terminal transition.
 | `get_schedule`                | ✅ Implemented     | Read-only record view of the linear schedule (issue #125), mirroring `get_tranche_schedule` and the other crates' record views; `NotFound` for unknown ids and tranche ids; no auth, no state change; `claimed` reflects completed claims |
 | Revocation                    | ❌ Not implemented | `Revoked` status reserved                                                                                                                                                                                                            |
 | `VestingSchedule.token` field | ✅ Wired           | Read by `claim` for the SEP-41 payout                                                                                                                                                                                                |
+| Events                        | ✅ Implemented     | `ScheduleCreated` and `Claimed` (`schedule_id` as topic); zero claims are silent                                                                                                                                                      |
 
 ## Multi-Sig Wallet (`crates/multi-sig-wallet`)
 
@@ -119,6 +120,27 @@ treasury at a terminal transition.
 
 ## Subscription Payments (`crates/subscription-payments`)
 
+| Entrypoint         | Status             | Notes                                                                   |
+| ------------------ | ------------------ | ----------------------------------------------------------------------- |
+| `subscribe`        | ✅ Implemented     | Plan validation, periodic scheduling                                    |
+| `charge`           | ✅ Implemented     | Real SEP-41 transfer for one period; failed transfers enter `PastDue`   |
+| `charge_catchup`   | ✅ Implemented     | Atomically settles up to 32 elapsed periods per call; refuses `PastDue` |
+| `cancel`           | ✅ Implemented     | Subscriber or owner                                                     |
+| `get_subscription` | ✅ Implemented     | Read-only                                                               |
+| Storage / `touch_ttl` | ✅ Implemented | Subscription records use persistent storage with 30-day TTL bumps; counter and indexes stay in instance storage |
+| Plan management    | ❌ Not implemented | Follow-up                                                               |
+
+## Marketplace Royalties (`crates/marketplace-royalties`)
+
+| Entrypoint               | Status             | Notes                                                                                                                 |
+| ------------------------ | ------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `set_royalty`            | ✅ Implemented     | Basis-point caps validated                                                                                            |
+| `disable_royalty` / `enable_royalty` | ✅ Implemented | Collection-authorized status transitions preserve stored bps and recipient |
+| `distribute`             | ⚠️ Computes only   | Pure split math; **pays no recipients** (use `settle_sale`)                                                           |
+| `settle_sale`            | ✅ Implemented     | **Real token transfers** payer → seller, then payer → royalty recipient; transfer-before-state, totals committed last |
+| `get_royalty`            | ✅ Implemented     | Read-only                                                                                                             |
+| `get_settlement_summary` | ✅ Implemented     | Read-only; cumulative sales, volume, and royalties per collection                                                     |
+| Multi-recipient splits   | ❌ Not implemented | Follow-up                                                                                                             |
 | Entrypoint | Status | Notes |
 |---|---|---|
 | `subscribe` | ✅ Implemented | Validates `amount > 0` / `period > 0` before auth; subscriber-authorized; record + sequential id + both subscriber/provider indexes written atomically |

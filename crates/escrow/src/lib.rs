@@ -570,6 +570,11 @@ pub trait SorobanForgeEscrow {
     ///
     /// * [`ForgeError::NotFound`] — no escrow of either kind with this id.
     fn touch_ttl(env: Env, escrow_id: u64) -> Result<(), ForgeError>;
+
+    /// Read the estimated remaining TTL of a present escrow record in ledgers.
+    ///
+    /// The view is read-only and does not extend either persistent entry.
+    fn ttl_info(env: Env, escrow_id: u64) -> Result<u32, ForgeError>;
 }
 
 /// Lifecycle state of an escrow.
@@ -826,6 +831,9 @@ pub enum DataKey {
     /// would migrate to a sharded scheme — a compatible upgrade since the
     /// view only ever reads through this key class.
     ParticipantIndex(Address),
+    /// Expiration ledger mirrored for an escrow record because SDK 27
+    /// exposes TTL introspection to test utilities but not contract code.
+    EscrowExpiration(u64),
 }
 
 /// The deployable escrow contract.
@@ -1500,6 +1508,20 @@ impl Escrow {
             return Err(ForgeError::NotFound);
         }
         Ok(())
+    }
+
+    /// Return the remaining ledger count before the escrow record expires.
+    ///
+    /// `NotFound` means the id never existed or its persistent entry is
+    /// already archived. This view performs no TTL extension.
+    pub fn ttl_info(env: Env, escrow_id: u64) -> Result<u32, ForgeError> {
+        Self::load_escrow(&env, escrow_id)?;
+        let expiry: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowExpiration(escrow_id))
+            .ok_or(ForgeError::NotFound)?;
+        Ok(expiry.saturating_sub(env.ledger().sequence()))
     }
 
     // -------------------------------------------------------------------

@@ -21,8 +21,8 @@ contract** and remain open for the other four:
    `distribute`'s real royalty payout — and multi-sig `execute` performs
    real cross-contract invocations;
    subscriptions still move nothing.
-2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, and marketplace royalties now use **persistent** entries with TTL bumps on every write and permissionless `touch_ttl` keeper entrypoints. Vesting and subscriptions still use instance storage.
-3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit lifecycle events; only vesting remains silent.
+2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, marketplace royalties, and subscription records use **persistent** entries with TTL bumps and permissionless `touch_ttl` keeper entrypoints. Vesting records remain in instance storage; subscription counters and enumeration indexes remain instance-scoped.
+3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, marketplace royalties, and vesting emit lifecycle events.
 4. **Arbiter stored but unreachable** — `dispute` (claimant-authorized)
    and `resolve` (arbiter-only, final) make the third party live.
    `Disputed` is a real state, verified by tests.
@@ -48,8 +48,13 @@ transition.) The remaining contract gets its own tranche using the escrow
 pattern (see
 [RESUBMISSION.md](RESUBMISSION.md#phase-1--flagship-escrow-primitive-3-weeks)).
 
-### 2. Instance-only storage outside escrow, multi-sig wallet, DAO governance, and marketplace royalties
+### 2. Instance-only storage outside escrow, multi-sig wallet, DAO governance, marketplace royalties, and subscriptions
 
+Vesting schedule records remain in `env.storage().instance()` and face the
+byte-budget and TTL-expiry bricking problem. Subscription records moved to
+persistent storage with `touch_ttl`; their small counter and enumeration
+indexes remain in instance storage. Escrow, multi-sig wallet, DAO governance,
+and marketplace royalties also use persistent records with keeper entrypoints.
 Vesting and subscriptions keep state in `env.storage().instance()`.
 Long-lived records there still face the byte budget and TTL-expiry
 bricking problem. (Escrow, multi-sig wallet, DAO governance, and marketplace royalties migrated per-record data to persistent storage with `touch_ttl`/`touch_tx_ttl` keeper entrypoints.)
@@ -60,9 +65,17 @@ extended. The permissionless keepers (`touch_tx_ttl`, `touch_ttl`) cover
 this, but who runs them is an operational question — off-chain keepers must
 visit live transactions and proposals within the 30-day horizon.
 
-### 3. No events in vesting contract
+An escrow whose persistent entry expires becomes inaccessible to contract
+calls until the entry is restored. Keepers can monitor its remaining TTL with
+`ttl_info` and call `touch_ttl` before expiry; `NotFound` from either means
+the id never existed or the entry is already archived. Archived entries need
+a transaction-level `RestoreFootprintOp` (or protocol auto-restoration from a
+simulated invocation) before contract access can resume. The token balance
+remains held by the escrow contract while the record is archived.
 
-Vesting remains without an event module. Escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed on-chain events.
+### 3. No events in other contracts
+
+Vesting, escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed lifecycle events. Other contracts remain to be assessed for event coverage.
 
 
 ### 4. Negative authorization coverage outside escrow, vesting, and DAO governance

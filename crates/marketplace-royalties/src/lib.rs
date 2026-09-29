@@ -99,6 +99,20 @@ pub trait SorobanForgeMarketplaceRoyalties {
         bps: u32,
     ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 
+    /// Disable royalty enforcement while retaining the configured recipient and rate.
+    fn disable_royalty(
+        env: Env,
+        collection: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Re-enable a previously disabled royalty configuration.
+    fn enable_royalty(
+        env: Env,
+        collection: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Distribute `amount` from a sale of `collection`, returning the net to
+    /// the seller after royalties. Pure computation: no tokens move.
     /// Distribute the royalty share of `amount` from a sale of `collection`:
     /// transfer it from `payer` to the configured recipient in `token` and
     /// return the net owed to the seller after royalties. A standalone
@@ -361,6 +375,49 @@ impl MarketplaceRoyalties {
         Ok(())
     }
 
+    /// Disable royalties for `collection`, retaining its stored configuration.
+    pub fn disable_royalty(env: Env, collection: Address) -> Result<(), ForgeError> {
+        Self::transition_status(
+            &env,
+            &collection,
+            RoyaltyStatus::Active,
+            RoyaltyStatus::Disabled,
+        )
+    }
+
+    /// Re-enable royalties for `collection` with its original recipient and rate.
+    pub fn enable_royalty(env: Env, collection: Address) -> Result<(), ForgeError> {
+        Self::transition_status(
+            &env,
+            &collection,
+            RoyaltyStatus::Disabled,
+            RoyaltyStatus::Active,
+        )
+    }
+
+    fn transition_status(
+        env: &Env,
+        collection: &Address,
+        expected: RoyaltyStatus,
+        next: RoyaltyStatus,
+    ) -> Result<(), ForgeError> {
+        let key = DataKey::Royalty(collection.clone());
+        let mut royalty: Royalty = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ForgeError::NotFound)?;
+        if royalty.status != expected {
+            return Err(ForgeError::InvalidInput);
+        }
+        collection.require_auth();
+        royalty.status = next;
+        env.storage().persistent().set(&key, &royalty);
+        bump_entry(env, &key);
+        Ok(())
+    }
+
+    /// Compute the royalty split for a sale.
     /// Distribute the royalty share of `amount` from a sale of `collection`
     /// in `token`.
     ///
@@ -944,6 +1001,43 @@ mod tests {
     }
 
     #[test]
+    fn royalty_can_be_disabled_and_reenabled_without_losing_config() {
+        let (_env, client, accounts) = setup!();
+        let original = client.get_royalty(&accounts.arbiter);
+        client.disable_royalty(&accounts.arbiter);
+        let disabled = client.get_royalty(&accounts.arbiter);
+        assert_eq!(disabled.status, RoyaltyStatus::Disabled);
+        assert_eq!(
+            client.distribute(&accounts.arbiter, &accounts.user1, &1_000),
+            1_000
+        );
+        assert_eq!(
+            client
+                .try_disable_royalty(&accounts.arbiter)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+        client.enable_royalty(&accounts.arbiter);
+        assert_eq!(
+            client.get_royalty(&accounts.arbiter).status,
+            RoyaltyStatus::Active
+        );
+        assert_eq!(
+            client.get_royalty(&accounts.arbiter).recipient,
+            original.recipient
+        );
+        assert_eq!(client.get_royalty(&accounts.arbiter).bps, original.bps);
+        assert_eq!(
+            client
+                .try_enable_royalty(&accounts.arbiter)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+    }
+
+    #[test]
     fn set_royalty_update_in_place() {
         let (_env, client, accounts) = setup!();
         client.set_royalty(&accounts.arbiter, &accounts.user3, &1_000_u32);
@@ -1263,26 +1357,13 @@ mod tests {
 
     #[test]
     fn settle_disabled_config_settles_in_full_to_seller() {
-        let (env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let (_env, token, tc, _contract_id, client, accounts) = setup_settlement!();
         let payer = &accounts.user1;
         let recipient = &accounts.user2;
         let seller = &accounts.user3;
         let collection = &accounts.arbiter;
 
-        // `set_royalty` has no public "disable" switch (it always stores
-        // `Active`), so write the `Disabled` record directly — the same gap
-        // the compute-only `distribute` suite documents.
-        let disabled = Royalty {
-            collection: collection.clone(),
-            recipient: recipient.clone(),
-            bps: 500,
-            status: RoyaltyStatus::Disabled,
-        };
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Royalty(collection.clone()), &disabled);
-        });
+        client.disable_royalty(collection);
 
         let settled = client.settle_sale(collection, &1_u64, &token, payer, seller, &1_000_i128);
 
