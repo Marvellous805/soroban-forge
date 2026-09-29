@@ -22,7 +22,7 @@ license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/Meet-hybrid/soroban-forge"
 
 [workspace.dependencies]
-soroban-sdk       = "=27.0.6"
+soroban-sdk       = "=28.0.0"
 soroban-sdk-macros = "=27.0.6"
 clap              = { version = "4.5", features = ["derive"] }
 
