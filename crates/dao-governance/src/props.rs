@@ -48,13 +48,32 @@
 //! Four deterministic companion unit tests pin each boundary case explicitly
 //! (see end of file), complementing the randomized P3 suite.
 //!
+//! **P5 — Failure-sequence bond conservation.** Randomized sequences mixing
+//! the three bond custody paths (pull, refund, forfeit) with the two
+//! terminal bond moves (execute, cancel), driven into territory where the
+//! transfer itself fails:
+//!
+//! ```text
+//! treasury_balance + Σ refunded bond_amounts + contract custody
+//!     == proposal_count * BOND
+//! ```
+//!
+//! The equation is asserted on the real SAC after **every** action, not
+//! only at the end of the sequence, via [`World::assert_balance_invariant`].
+//!
+//! **Failed-pull purity.** A bond pull that fails must leave no residue:
+//! no proposal record, no consumed id, no movement of the custody total,
+//! and no movement of any SAC balance. Retrying the same proposer with
+//! exactly the bond then succeeds and leaves a zero balance.
+//!
 //! All properties run against a real Stellar Asset Contract for bond custody.
 //! Runs are deterministic (fixed strategy bounds, proptest's default seed);
 //! a failure prints its case seed for replay. Override the case count with
 //! `PROPTEST_CASES=n cargo test -p soroban-forge-dao-governance props`.
 
-use crate::{DaoGovernance, ProposalState, SorobanForgeDaoGovernanceClient};
+use crate::{BondState, DaoGovernance, DataKey, ProposalState, SorobanForgeDaoGovernanceClient};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_forge_test_utils::{MockTarget, TestAccounts};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
@@ -140,6 +159,65 @@ impl World {
     /// Return the voter at `idx % VOTER_POOL_SIZE` from the pool.
     fn voter(&self, idx: usize) -> &Address {
         &self.voters[idx % VOTER_POOL_SIZE]
+    }
+
+    /// Assert bond conservation against the **real** Stellar Asset Contract
+    /// balances after any sequence of actions:
+    ///
+    /// ```text
+    /// treasury_balance + Σ refunded bond_amounts + contract custody
+    ///     == proposal_count * BOND
+    /// ```
+    ///
+    /// `treasury_balance` and `custody` are read straight off the SAC, so a
+    /// forfeit that lands on the wrong address, a refund that never leaves
+    /// the contract, or a double-pay all move the left-hand side away from
+    /// the right-hand side. The contract's internal `BondHeld` running
+    /// total is pinned to its real token balance as a second, independent
+    /// check.
+    ///
+    /// Returns `Err(TestCaseError)` so proptest can shrink the failing
+    /// input; callers propagate it with `?`.
+    fn assert_balance_invariant(&self) -> Result<(), TestCaseError> {
+        let config = self.client().get_bond_config();
+        let sac = StellarAssetClient::new(&self.env, &config.token);
+
+        let treasury_balance = sac.balance(&config.treasury);
+        let custody = sac.balance(&self.contract_id);
+        let held = self.env.as_contract(&self.contract_id, || {
+            self.env
+                .storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::BondHeld)
+                .unwrap_or(0)
+        });
+
+        let count = self.client().get_proposal_count();
+        let limit = (count.min(u64::from(u32::MAX)) as u32).max(1);
+        let mut refunded: i128 = 0;
+        for proposal in self.client().get_proposals(&0, &limit).iter() {
+            if proposal.bond_state == BondState::Refunded {
+                refunded += proposal.bond_amount;
+            }
+        }
+
+        prop_assert_eq!(
+            held,
+            custody,
+            "BondHeld ({}) must equal the contract's real token balance ({})",
+            held,
+            custody
+        );
+        prop_assert_eq!(
+            treasury_balance + refunded + custody,
+            count as i128 * BOND,
+            "conservation broken: treasury={} refunded={} custody={} bonds_pulled={}",
+            treasury_balance,
+            refunded,
+            custody,
+            count as i128 * BOND
+        );
+        Ok(())
     }
 }
 
@@ -435,154 +513,283 @@ fn p3_against_majority_is_defeated() {
 }
 
 // -----------------------------------------------------------------------
-// P5 — Failure-sequence invariant
+// P5 — Failure-sequence bond conservation
 // -----------------------------------------------------------------------
+// Randomized action sequences over the three bond custody paths (pull,
+// refund, forfeit) and the two terminal bond moves (execute, cancel),
+// driven into territory where the transfer itself fails. After *every*
+// action the real-SAC conservation equation asserted by
+// `World::assert_balance_invariant` must hold:
+//
+//   treasury_balance + Σ refunded bond_amounts + contract custody
+//       == proposal_count * BOND
 
-/// Randomized sequences that include underfunded proposers (bond pull fails),
-/// executed-proposal bond refunds, and defeated/cancelled forfeits.
-// After every action step we assert conservation:
-//   treasury_balance + Σ proposer_refunds + Σ contract_custody = Σ bonds_pulled
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// After every action step the balance invariant holds.
+    /// For any bounded sequence of failure-path actions, the bond
+    /// conservation equation
+    ///
+    /// ```text
+    /// treasury_balance + Σ refunded bond_amounts + contract custody
+    ///     == proposal_count * BOND
+    /// ```
+    ///
+    /// holds on the real Stellar Asset Contract after **every** action,
+    /// not merely at the end of the sequence. The action space covers:
+    ///
+    /// - `Propose(balance)` — a freshly generated proposer funded with
+    ///   `0`, `BOND - 1`, `BOND`, or `FUNDS`. The underfunded cases must
+    ///   fail with `ForgeError::TokenTransferFailed` and must not consume
+    ///   a proposal id; the funded cases must post the bond.
+    /// - `ExecutePass` — the two-phase execute path (finalise, then
+    ///   dispatch + refund): the bond returns to the proposer.
+    /// - `ExecuteDefeat` — an unvoted proposal finalises `Defeated` and
+    ///   forfeits its bond to the configured treasury.
+    /// - `Cancel` — the proposer withdraws and the bond is refunded.
     #[test]
     fn p5_failure_sequence_preserves_bond_conservation(
         actions in failure_sequence(),
     ) {
         let w = setup_world();
+        let token = w.client().get_bond_config().token;
+        let sac = StellarAssetClient::new(&w.env, &token);
 
         for action in &actions {
             match action {
-                FailureAction::Propose { proposer_idx, funded } => {
-                    let before_count = w.client().get_proposal_count();
-                    let before_held = soroban_forge_test_utils::bond_held(&w.env, &w.contract_id);
-                    // Mint user1 with appropriate balance before propose
-                    let token = w.client().get_bond_config().unwrap().token;
-                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
-                    if *funded {
-                        token_client.mint(&w.accounts.user1, &FUNDS);
-                    } else {
-                        token_client.mint(&w.accounts.user1, & (BOND - 1));
+                FailureAction::Propose(balance) => {
+                    let proposer = Address::generate(&w.env);
+                    if *balance > 0 {
+                        sac.mint(&proposer, balance);
                     }
-                    let _ = w.client().try_propose(
-                        &w.accounts.user1,
-                        &w.target,
-                        &w.payload(),
-                        &DURATION,
-                    );
-                    w.assert_balance_invariant();
+                    let before = w.client().get_proposal_count();
+                    let res = w
+                        .client()
+                        .try_propose(&proposer, &w.target, &w.payload(), &DURATION);
+
+                    if *balance < BOND {
+                        prop_assert!(
+                            matches!(res, Err(Ok(ForgeError::TokenTransferFailed))),
+                            "a proposer funded with {} (< BOND {}) must fail the bond pull, got {:?}",
+                            balance,
+                            BOND,
+                            res
+                        );
+                        prop_assert_eq!(
+                            w.client().get_proposal_count(),
+                            before,
+                            "a failed bond pull must not consume a proposal id"
+                        );
+                    } else {
+                        prop_assert!(
+                            matches!(res, Ok(Ok(_))),
+                            "a proposer funded with {} (>= BOND {}) must post the bond, got {:?}",
+                            balance,
+                            BOND,
+                            res
+                        );
+                    }
                 }
-                FailureAction::Execute => {
-                    let proposal_id = w.propose();
-                    // Ensure user1 is funded for execute
-                    let token = w.client().get_bond_config().unwrap().token;
-                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
-                    token_client.mint(&w.accounts.user1, &FUNDS);
-                    w.env.ledger().set_timestamp(START + DURATION + 1);
-                    let _ = w.client().try_execute(&proposal_id);
-                    w.assert_balance_invariant();
+                FailureAction::ExecutePass => {
+                    let proposer = Address::generate(&w.env);
+                    sac.mint(&proposer, &FUNDS);
+                    let id = w.client().propose(&proposer, &w.target, &w.payload(), &DURATION);
+                    w.client().vote(&id, w.voter(0), &true);
+                    w.env
+                        .ledger()
+                        .set_timestamp(w.env.ledger().timestamp() + DURATION + 1);
+                    w.client().execute(&id); // Active -> Succeeded
+                    w.client().execute(&id); // Succeeded -> Executed + refund
+                }
+                FailureAction::ExecuteDefeat => {
+                    let proposer = Address::generate(&w.env);
+                    sac.mint(&proposer, &FUNDS);
+                    let id = w.client().propose(&proposer, &w.target, &w.payload(), &DURATION);
+                    w.env
+                        .ledger()
+                        .set_timestamp(w.env.ledger().timestamp() + DURATION + 1);
+                    w.client().execute(&id); // Active -> Defeated + forfeit
                 }
                 FailureAction::Cancel => {
-                    let proposal_id = w.propose();
-                    // Ensure user1 is funded for cancel
-                    let token = w.client().get_bond_config().unwrap().token;
-                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
-                    token_client.mint(&w.accounts.user1, &FUNDS);
-                    let _ = w.client().try_cancel_proposal(&proposal_id, &w.accounts.user1);
-                    w.assert_balance_invariant();
+                    let proposer = Address::generate(&w.env);
+                    sac.mint(&proposer, &FUNDS);
+                    let id = w.client().propose(&proposer, &w.target, &w.payload(), &DURATION);
+                    w.client().cancel_proposal(&id, &proposer);
                 }
             }
+
+            w.assert_balance_invariant()?;
         }
     }
 }
 
-#[derive(Debug)]
+/// One step of a failure-heavy action sequence.
+#[derive(Clone, Debug)]
 enum FailureAction {
-    Propose { proposer_idx: usize, funded: bool },
-    Execute,
+    /// `try_propose` from a proposer holding exactly this many tokens.
+    Propose(i128),
+    /// Finalise a passing proposal and refund its bond to the proposer.
+    ExecutePass,
+    /// Finalise an unvoted proposal and forfeit its bond to the treasury.
+    ExecuteDefeat,
+    /// Withdraw an active proposal and refund its bond.
     Cancel,
 }
 
-// Build failure_sequence strategy using proptest's any and vec
+/// Funding levels handed to a generated proposer: completely unfunded, one
+/// unit short of the bond, exactly the bond, and comfortably funded.
+fn propose_balance() -> impl Strategy<Value = i128> {
+    prop_oneof![Just(0i128), Just(BOND - 1), Just(BOND), Just(FUNDS)]
+}
+
+/// A single failure-path action.
+fn failure_action() -> impl Strategy<Value = FailureAction> {
+    prop_oneof![
+        propose_balance().prop_map(FailureAction::Propose),
+        Just(FailureAction::ExecutePass),
+        Just(FailureAction::ExecuteDefeat),
+        Just(FailureAction::Cancel),
+    ]
+}
+
+/// A bounded sequence of 1..=16 failure-path actions.
 fn failure_sequence() -> impl Strategy<Value = std::vec::Vec<FailureAction>> {
-    proptest::collection::vec(any::<FailureAction>(), 1..=16)
+    prop::collection::vec(failure_action(), 1..=16)
 }
 
 // -----------------------------------------------------------------------
-// Failed-pull purity property
+// Failed-pull purity — transfer-before-state
 // -----------------------------------------------------------------------
 
-/// When the bond transfer fails, propose leaves proposal storage, the id
-/// counter, and secondary state untouched. Retrying with a funded balance
-/// then succeeds normally.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// A failed pull does not mutate storage; a subsequent funded propose
-    /// works correctly.
+    /// A bond pull that fails must leave **no** residue: no proposal
+    /// record, no consumed id, no movement of the custody total, and no
+    /// change to any SAC balance — proposer, contract, or treasury.
+    ///
+    /// `initial` covers the completely unfunded proposer (`0`) and the
+    /// proposer funded just below the bond (`BOND - 1`). The configured
+    /// bond token is a plain SAC, whose transfers carry no fee, so the
+    /// near-miss rung is the "funded almost to the bond" case; the retry
+    /// then funds the *same* proposer with exactly `BOND`, which must
+    /// succeed and leave a zero balance — pinning both the absence of a
+    /// transfer fee and the absence of residue from the failure.
     #[test]
-    fn failed_pull_purity_preserves_storage(
-        funded_idx in 0usize..VOTER_POOL_SIZE,
+    fn failed_pull_purity_leaves_no_residue(
+        initial in prop_oneof![Just(0i128), Just(BOND - 1)],
     ) {
         let w = setup_world();
+        let token = w.client().get_bond_config().token;
+        let sac = StellarAssetClient::new(&w.env, &token);
+        let proposer = Address::generate(&w.env);
+        if initial > 0 {
+            sac.mint(&proposer, &initial);
+        }
 
-        // --- Step 1: propose with underfunded proposer (user1) ---
         let before_count = w.client().get_proposal_count();
-        let before_held = soroban_forge_test_utils::bond_held(&w.env, &w.contract_id);
+        let before_proposer = sac.balance(&proposer);
+        let before_custody = sac.balance(&w.contract_id);
+        let before_treasury = sac.balance(&w.accounts.deployer);
+        let before_held = w.env.as_contract(&w.contract_id, || {
+            w.env
+                .storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::BondHeld)
+                .unwrap_or(0)
+        });
 
-        // Mint user1 with less than the bond amount
-        let token = w.client().get_bond_config().unwrap().token;
-        let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
-        token_client.mint(&w.accounts.user1, & (BOND - 1));
-
-        let err = w.client().try_propose(&w.accounts.user1, &w.target, &w.payload(), &DURATION)
-            .unwrap_err()
-            .unwrap();
-        prop_assert_eq!(
-            err,
-            ForgeError::TokenTransferFailed,
-            "propose with underfunded proposer must fail with TokenTransferFailed"
+        // --- Step 1: the pull fails, cleanly ---
+        let res = w
+            .client()
+            .try_propose(&proposer, &w.target, &w.payload(), &DURATION);
+        prop_assert!(
+            matches!(res, Err(Ok(ForgeError::TokenTransferFailed))),
+            "a proposer funded with {} (< BOND {}) must fail the bond pull, got {:?}",
+            initial,
+            BOND,
+            res
         );
-
-        // Storage must be unchanged
         prop_assert_eq!(
             w.client().get_proposal_count(),
             before_count,
-            "proposal count must be unchanged after failed pull"
+            "a failed bond pull must not consume a proposal id"
         );
         prop_assert_eq!(
-            soroban_forge_test_utils::bond_held(&w.env, &w.contract_id),
+            w.client()
+                .try_get_proposal(&(before_count + 1))
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound,
+            "a failed bond pull must not write a proposal record"
+        );
+        prop_assert_eq!(
+            w.env.as_contract(&w.contract_id, || {
+                w.env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, i128>(&DataKey::BondHeld)
+                    .unwrap_or(0)
+            }),
             before_held,
-            "bond held must be unchanged after failed pull"
+            "a failed bond pull must not move the custody total"
         );
+        prop_assert_eq!(
+            sac.balance(&w.contract_id),
+            before_custody,
+            "a failed bond pull must not move contract custody"
+        );
+        prop_assert_eq!(
+            sac.balance(&proposer),
+            before_proposer,
+            "a failed bond pull must not move the proposer's balance"
+        );
+        prop_assert_eq!(
+            sac.balance(&w.accounts.deployer),
+            before_treasury,
+            "a failed bond pull must not move the treasury balance"
+        );
+        w.assert_balance_invariant()?;
 
-        // --- Step 2: propose with funded user1 ---
-        let funded_proposal_id = w.client().propose(
-            &w.accounts.user1,
-            &w.target,
-            &w.payload(),
-            &DURATION,
-        );
-
-        let funded_proposal = w.client().get_proposal(&funded_proposal_id);
+        // --- Step 2: retry with exactly the bond ---
+        let top_up = BOND - initial;
+        if top_up > 0 {
+            sac.mint(&proposer, &top_up);
+        }
         prop_assert_eq!(
-            funded_proposal.state,
-            ProposalState::Active,
-            "funded propose must create Active proposal"
-        );
-        prop_assert_eq!(
-            funded_proposal.bond_state,
-            soroban_forge::BondState::Posted,
-            "bond state must be Posted"
-        );
-        prop_assert_eq!(
-            funded_proposal.bond_amount,
+            sac.balance(&proposer),
             BOND,
-            "bond amount must equal configured bond"
+            "the retry must fund the proposer with exactly the bond"
         );
 
-        // Verify balance invariant after the successful propose
-        w.assert_balance_invariant();
+        let proposal_id = w.client().propose(&proposer, &w.target, &w.payload(), &DURATION);
+        prop_assert_eq!(
+            w.client().get_proposal_count(),
+            before_count + 1,
+            "the retry must consume exactly one proposal id"
+        );
+        prop_assert_eq!(
+            sac.balance(&proposer),
+            0,
+            "the pull consumes exactly the bond — a SAC transfer charges no fee"
+        );
+
+        let proposal = w.client().get_proposal(&proposal_id);
+        prop_assert_eq!(
+            proposal.state,
+            ProposalState::Active,
+            "the retried proposal must be Active"
+        );
+        prop_assert_eq!(
+            proposal.bond_state,
+            BondState::Posted,
+            "the retried proposal must have posted its bond"
+        );
+        prop_assert_eq!(
+            proposal.bond_amount,
+            BOND,
+            "the posted bond must equal the configured bond"
+        );
+        w.assert_balance_invariant()?;
     }
 }
