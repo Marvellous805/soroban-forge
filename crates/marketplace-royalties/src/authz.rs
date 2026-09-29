@@ -116,7 +116,7 @@ fn distribute_accepts_collection_and_payer_signatures() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -125,7 +125,7 @@ fn distribute_accepts_collection_and_payer_signatures() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[MockAuthInvoke {
                     contract: &token,
                     fn_name: "transfer",
@@ -158,7 +158,7 @@ fn distribute_rejects_seller_signature() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -167,7 +167,7 @@ fn distribute_rejects_seller_signature() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[MockAuthInvoke {
                     contract: &token,
                     fn_name: "transfer",
@@ -197,7 +197,7 @@ fn distribute_rejects_payer_signature_without_token_authorization() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -206,7 +206,7 @@ fn distribute_rejects_payer_signature_without_token_authorization() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "distribute",
-                args: (&collection, &1_u64, &token, &payer, &seller, AMOUNT).into_val(&env),
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
                 sub_invokes: &[],
             },
         },

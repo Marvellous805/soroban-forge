@@ -797,7 +797,7 @@ fn active_royalty(env: &Env, collection: &Address, token_id: u64) -> Result<Roya
         Ok(token_royalty)
     } else {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Royalty(collection.clone()))
             .ok_or(ForgeError::NotFound)
     }
