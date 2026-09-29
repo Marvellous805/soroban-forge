@@ -46,11 +46,12 @@
 
 use crate::{SorobanForgeVestingClient, Tranche, Vesting, VestingSchedule, VestingStatus};
 use proptest::prelude::*;
-use std::vec::Vec;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::{Address, Env};
+use std::vec;
+use std::vec::Vec;
 
 const START: u64 = 1_000_000;
 const MAX_AMOUNT: i128 = 1_000_000_000_000;
