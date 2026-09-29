@@ -49,7 +49,7 @@ use proptest::prelude::*;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, Env};
 
 const START: u64 = 1_000_000;
 const MAX_AMOUNT: i128 = 1_000_000_000_000;
@@ -149,8 +149,8 @@ fn arb_schedule_params() -> impl Strategy<Value = (i128, u64, u64)> {
 /// Strategies produce plain tuples because proptest strategies run outside
 /// any `Env`; host objects like `soroban_sdk::Vec` must be allocated in the
 /// case's own environment, which only exists once the test body starts.
-fn to_tranche_vec(env: &Env, table: &[(u64, i128)]) -> Vec<Tranche> {
-    let mut tranches = Vec::new(env);
+fn to_tranche_vec(env: &Env, table: &[(u64, i128)]) -> soroban_sdk::Vec<Tranche> {
+    let mut tranches = soroban_sdk::Vec::new(env);
     for (unlock_at, amount) in table {
         tranches.push_back(Tranche {
             unlock_at: *unlock_at,

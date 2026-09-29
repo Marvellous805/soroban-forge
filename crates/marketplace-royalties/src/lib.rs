@@ -1387,7 +1387,7 @@ mod tests {
         });
 
         // Set active override for token_id to 10% (1_000 bps) to user4
-        client.set_token_royalty(collection, &token_id, &accounts.user4, &1_000_u32);
+        client.set_token_royalty(collection, &token_id, &accounts.user3, &1_000_u32);
 
         let settled = client.settle_sale(collection, &token_id, &token, payer, seller, &1_000_i128);
 

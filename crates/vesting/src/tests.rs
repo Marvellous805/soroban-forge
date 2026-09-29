@@ -57,18 +57,18 @@ fn create_schedule_succeeds_and_is_locked() {
 #[test]
 fn lifecycle_events_cover_creation_claim_and_silent_zero_claim() {
     let (env, token, _tc, _cid, client, accounts) = setup!();
-    let before_create = env.events().all().len();
+    let before_create = env.events().all().events().len();
     let id = create(&client, &token, &accounts);
-    assert_eq!(env.events().all().len(), before_create + 1);
+    assert_eq!(env.events().all().events().len(), before_create + 1);
 
-    let after_create = env.events().all().len();
+    let after_create = env.events().all().events().len();
     assert_eq!(client.claim(&id), 0);
-    assert_eq!(env.events().all().len(), after_create);
+    assert_eq!(env.events().all().events().len(), after_create);
 
     env.ledger().set_timestamp(START + DURATION);
-    let before_claim = env.events().all().len();
+    let before_claim = env.events().all().events().len();
     assert_eq!(client.claim(&id), TOTAL);
-    assert!(env.events().all().len() > before_claim);
+    assert!(env.events().all().events().len() > before_claim);
 }
 
 #[test]

@@ -378,7 +378,14 @@ fn settle_sale_rejects_replayed_signature_with_altered_args() {
         },
     ]);
 
-    let res = client.try_settle_sale(&collection, &1_u64, &token, &payer, &seller, &altered_amount);
+    let res = client.try_settle_sale(
+        &collection,
+        &1_u64,
+        &token,
+        &payer,
+        &seller,
+        &altered_amount,
+    );
     assert_auth_abort!(res);
 }
 
