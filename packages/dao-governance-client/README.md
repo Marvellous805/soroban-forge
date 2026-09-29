@@ -7,6 +7,10 @@ The client is generated **offline** from the contract's WASM ABI by the Stellar
 CLI, so every method is fully typed and carries the doc comments from the
 contract source.
 
+Before proposals can be created, initialize the deployed contract with both
+`configure_bond` and `configure_category_rules`. After changing the contract
+interface, regenerate this client with `bash scripts/generate-clients.sh`.
+
 ## Install
 
 ```bash
@@ -27,6 +31,13 @@ const client = new Client({
 
 // Every contract method is available, typed, with `try*` variants:
 const id = await client.propose({ proposer, target, action, duration });
+// Or select a configured voting category:
+const financialId = await client.propose_with_category({
+  proposer,
+  target,
+  action,
+  category: { tag: "Financial", values: undefined },
+});
 await client.vote({ proposal_id: id.result, voter, support });
 await client.execute({ proposal_id: id.result });
 ```

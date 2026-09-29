@@ -74,6 +74,7 @@ macro_rules! setup {
         let client = SorobanForgeDaoGovernanceClient::new(&env, &contract_id);
         let accounts = TestAccounts::generate(&env);
         client.configure_bond(&token, &BOND, &accounts.deployer);
+        client.configure_category_rules(&crate::test_category_rules(&env, DURATION));
         token_admin.mint(&accounts.user1, &FUNDS);
         let target_id = env.register(MockTarget, ());
 

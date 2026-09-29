@@ -119,6 +119,7 @@ fn setup_world() -> World {
 
     let accounts = TestAccounts::generate(&env);
     client.configure_bond(&token, &BOND, &accounts.deployer);
+    client.configure_category_rules(&crate::test_category_rules(&env, DURATION));
     token_admin.mint(&accounts.user1, &FUNDS);
 
     let mut voters = std::vec::Vec::with_capacity(VOTER_POOL_SIZE);
