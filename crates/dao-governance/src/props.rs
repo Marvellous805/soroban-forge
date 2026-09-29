@@ -433,3 +433,156 @@ fn p3_against_majority_is_defeated() {
         "1 for / 2 against must produce Defeated"
     );
 }
+
+// -----------------------------------------------------------------------
+// P5 — Failure-sequence invariant
+// -----------------------------------------------------------------------
+
+/// Randomized sequences that include underfunded proposers (bond pull fails),
+/// executed-proposal bond refunds, and defeated/cancelled forfeits.
+// After every action step we assert conservation:
+//   treasury_balance + Σ proposer_refunds + Σ contract_custody = Σ bonds_pulled
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// After every action step the balance invariant holds.
+    #[test]
+    fn p5_failure_sequence_preserves_bond_conservation(
+        actions in failure_sequence(),
+    ) {
+        let w = setup_world();
+
+        for action in &actions {
+            match action {
+                FailureAction::Propose { proposer_idx, funded } => {
+                    let before_count = w.client().get_proposal_count();
+                    let before_held = soroban_forge_test_utils::bond_held(&w.env, &w.contract_id);
+                    // Mint user1 with appropriate balance before propose
+                    let token = w.client().get_bond_config().unwrap().token;
+                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
+                    if *funded {
+                        token_client.mint(&w.accounts.user1, &FUNDS);
+                    } else {
+                        token_client.mint(&w.accounts.user1, & (BOND - 1));
+                    }
+                    let _ = w.client().try_propose(
+                        &w.accounts.user1,
+                        &w.target,
+                        &w.payload(),
+                        &DURATION,
+                    );
+                    w.assert_balance_invariant();
+                }
+                FailureAction::Execute => {
+                    let proposal_id = w.propose();
+                    // Ensure user1 is funded for execute
+                    let token = w.client().get_bond_config().unwrap().token;
+                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
+                    token_client.mint(&w.accounts.user1, &FUNDS);
+                    w.env.ledger().set_timestamp(START + DURATION + 1);
+                    let _ = w.client().try_execute(&proposal_id);
+                    w.assert_balance_invariant();
+                }
+                FailureAction::Cancel => {
+                    let proposal_id = w.propose();
+                    // Ensure user1 is funded for cancel
+                    let token = w.client().get_bond_config().unwrap().token;
+                    let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
+                    token_client.mint(&w.accounts.user1, &FUNDS);
+                    let _ = w.client().try_cancel_proposal(&proposal_id, &w.accounts.user1);
+                    w.assert_balance_invariant();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FailureAction {
+    Propose { proposer_idx: usize, funded: bool },
+    Execute,
+    Cancel,
+}
+
+// Build failure_sequence strategy using proptest's any and vec
+fn failure_sequence() -> impl Strategy<Value = std::vec::Vec<FailureAction>> {
+    proptest::collection::vec(any::<FailureAction>(), 1..=16)
+}
+
+// -----------------------------------------------------------------------
+// Failed-pull purity property
+// -----------------------------------------------------------------------
+
+/// When the bond transfer fails, propose leaves proposal storage, the id
+/// counter, and secondary state untouched. Retrying with a funded balance
+/// then succeeds normally.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A failed pull does not mutate storage; a subsequent funded propose
+    /// works correctly.
+    #[test]
+    fn failed_pull_purity_preserves_storage(
+        funded_idx in 0usize..VOTER_POOL_SIZE,
+    ) {
+        let w = setup_world();
+
+        // --- Step 1: propose with underfunded proposer (user1) ---
+        let before_count = w.client().get_proposal_count();
+        let before_held = soroban_forge_test_utils::bond_held(&w.env, &w.contract_id);
+
+        // Mint user1 with less than the bond amount
+        let token = w.client().get_bond_config().unwrap().token;
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&w.env, &token);
+        token_client.mint(&w.accounts.user1, & (BOND - 1));
+
+        let err = w.client().try_propose(&w.accounts.user1, &w.target, &w.payload(), &DURATION)
+            .unwrap_err()
+            .unwrap();
+        prop_assert_eq!(
+            err,
+            ForgeError::TokenTransferFailed,
+            "propose with underfunded proposer must fail with TokenTransferFailed"
+        );
+
+        // Storage must be unchanged
+        prop_assert_eq!(
+            w.client().get_proposal_count(),
+            before_count,
+            "proposal count must be unchanged after failed pull"
+        );
+        prop_assert_eq!(
+            soroban_forge_test_utils::bond_held(&w.env, &w.contract_id),
+            before_held,
+            "bond held must be unchanged after failed pull"
+        );
+
+        // --- Step 2: propose with funded user1 ---
+        let funded_proposal_id = w.client().propose(
+            &w.accounts.user1,
+            &w.target,
+            &w.payload(),
+            &DURATION,
+        );
+
+        let funded_proposal = w.client().get_proposal(&funded_proposal_id);
+        prop_assert_eq!(
+            funded_proposal.state,
+            ProposalState::Active,
+            "funded propose must create Active proposal"
+        );
+        prop_assert_eq!(
+            funded_proposal.bond_state,
+            soroban_forge::BondState::Posted,
+            "bond state must be Posted"
+        );
+        prop_assert_eq!(
+            funded_proposal.bond_amount,
+            BOND,
+            "bond amount must equal configured bond"
+        );
+
+        // Verify balance invariant after the successful propose
+        w.assert_balance_invariant();
+    }
+}
