@@ -40,17 +40,20 @@ macro_rules! setup {
         env.mock_all_auths();
         env.ledger().set_timestamp(START);
 
-        let token_fixture = soroban_forge_test_utils::TokenFixture::new(&env);
-        let token = token_fixture.address.clone();
+        let admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let token_admin = StellarAssetClient::new(&env, &token);
+        let token_client = TokenClient::new(&env, &token);
 
         let contract_id = env.register(Escrow, ());
         let client = SorobanForgeEscrowClient::new(&env, &contract_id);
 
         let accounts = soroban_forge_test_utils::TestAccounts::generate(&env);
         // Buyer starts funded; everyone else starts at zero.
-        token_fixture.mint(&accounts.user1, &AMOUNT);
+        token_admin.mint(&accounts.user1, &AMOUNT);
 
-        (env, token, token_fixture, contract_id, client, accounts)
+        (env, token, token_client, contract_id, client, accounts)
     }};
 }
 

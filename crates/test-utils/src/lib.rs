@@ -12,10 +12,10 @@ use soroban_sdk::Env;
 
 pub mod mocks;
 
+pub use mocks::TokenFixture;
 pub use mocks::{
     MockTarget, MockTargetClient, RevertingTarget, RevertingTargetClient, TestAccounts,
 };
-pub use mocks::TokenFixture;
 
 /// Create a [`Env`] configured for contract testing.
 ///

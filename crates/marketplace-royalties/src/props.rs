@@ -280,7 +280,7 @@ proptest! {
         bps in 0u32..=10_000_u32,
     ) {
         let w = setup_world(bps, amount);
-        let settlement = w.client().settle_sale(&w.collection, &w.token, &w.payer, &w.seller, &amount);
+        let settlement = w.client().settle_sale(&w.collection, &1_u64, &w.token, &w.payer, &w.seller, &amount);
 
         prop_assert_eq!(settlement.royalty_share + settlement.seller_net, amount, "settled shares must sum to amount");
         prop_assert!(settlement.seller_net >= 0);
@@ -417,6 +417,7 @@ proptest! {
                 &single_world.sellers[(*seller as usize) % single_world.sellers.len()];
             single_settled.push_back(single_world.client().settle_sale(
                 &single_world.collection,
+                &1_u64,
                 &single_world.token,
                 &single_world.payer,
                 seller,
@@ -541,6 +542,7 @@ proptest! {
         let w = setup_world(bps, WARM_UP + funding);
         w.client().settle_sale(
             &w.collection,
+            &1_u64,
             &w.token,
             &w.payer,
             &w.sellers[0],
@@ -599,6 +601,7 @@ proptest! {
                 let (_, amount) = plan[(position as usize) % plan.len()];
                 w.client().try_settle_sale(
                     &w.collection,
+                    &1_u64,
                     &w.token,
                     &w.payer,
                     &w.sellers[0],
@@ -607,6 +610,7 @@ proptest! {
             }
             2 => w.client().try_settle_sale(
                 &unconfigured,
+                &1_u64,
                 &w.token,
                 &w.payer,
                 &w.sellers[0],
@@ -616,6 +620,7 @@ proptest! {
             // holds — the single-sale twin of "all but the last sale".
             _ => w.client().try_settle_sale(
                 &w.collection,
+                &1_u64,
                 &w.token,
                 &w.payer,
                 &w.sellers[0],

@@ -1394,7 +1394,7 @@ mod tests {
         assert_eq!(settled.royalty_share, 100);
         assert_eq!(settled.seller_net, 900);
         assert_eq!(tc.balance(seller), 900);
-        assert_eq!(tc.balance(&accounts.user4), 100);
+        assert_eq!(tc.balance(&accounts.user3), 100);
         assert_eq!(tc.balance(recipient), 0);
     }
 
@@ -1663,6 +1663,7 @@ mod tests {
             };
             single.push_back(client_a.settle_sale(
                 &accounts_a.arbiter,
+                &1_u64,
                 &token_a,
                 &accounts_a.user1,
                 seller,
@@ -1712,7 +1713,7 @@ mod tests {
 
         let batch = sales_of(&env, &[(seller_a.clone(), 200), (seller_b.clone(), 100)]);
         client.settle_sales(collection, &token, payer, &batch);
-        client.settle_sale(collection, &token, payer, seller_a, &400_i128);
+        client.settle_sale(collection, &1_u64, &token, payer, seller_a, &400_i128);
 
         let summary = client.get_settlement_summary(collection);
         assert_eq!(summary.sales, 3);
@@ -1905,7 +1906,7 @@ mod tests {
         let collection = &accounts.arbiter;
         client.set_royalty(collection, recipient, &0_u32);
 
-        client.settle_sale(collection, &token, payer, seller, &100_i128);
+        client.settle_sale(collection, &1_u64, &token, payer, seller, &100_i128);
 
         // At 0 bps the split of `i128::MAX` is exact (share 0), so the
         // failure can only come from the aggregate check against the stored
@@ -2063,6 +2064,7 @@ mod tests {
         let collection = &accounts.arbiter;
         client.settle_sale(
             collection,
+            &1_u64,
             &token,
             &accounts.user1,
             &accounts.user3,
@@ -2091,6 +2093,7 @@ mod tests {
         client.set_royalty(collection, &accounts.user2, &500_u32);
         client.settle_sale(
             collection,
+            &1_u64,
             &token,
             &accounts.user1,
             &accounts.user3,
@@ -2120,6 +2123,7 @@ mod tests {
 
         let settlement = client.settle_sale(
             collection,
+            &1_u64,
             &token,
             &accounts.user1,
             &accounts.user3,
@@ -2151,6 +2155,7 @@ mod tests {
 
             let settlement = client.settle_sale(
                 collection,
+                &1_u64,
                 &token,
                 &accounts.user1,
                 &accounts.user3,
@@ -2234,6 +2239,7 @@ mod tests {
 
         let settlement = client.settle_sale(
             collection,
+            &1_u64,
             &token,
             &accounts.user1,
             &accounts.user3,

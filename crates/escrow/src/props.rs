@@ -35,9 +35,9 @@
 //! with `PROPTEST_CASES=n cargo test -p soroban-forge-escrow props`.
 
 use crate::{
-    BasketEscrowData, Escrow, EscrowAsset, EscrowData, EscrowStatus, SorobanForgeEscrowClient,
+    BasketEscrowData, Escrow, EscrowAsset, EscrowData, EscrowStatus, ParticipantEscrowsPage,
+    SorobanForgeEscrowClient,
 };
-use crate::{Escrow, EscrowData, EscrowStatus, ParticipantEscrowsPage, SorobanForgeEscrowClient};
 use proptest::prelude::*;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};

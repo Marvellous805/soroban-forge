@@ -2304,7 +2304,7 @@ mod tests {
             &AMOUNT,
             &PERIOD,
         );
-        client.subscribe(
+        let id = client.subscribe(
             &accounts.user1,
             &accounts.validator,
             &accounts.deployer,
