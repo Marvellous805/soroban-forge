@@ -202,9 +202,7 @@ use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, Address, Env, Vec,
 };
 
-use soroban_forge_shared_utils::{
-    transfer_from_contract, transfer_to_contract, ForgeError,
-};
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 
 /// Ledger-time constants for TTL bumps.
 ///
@@ -220,7 +218,6 @@ mod ttl {
     /// Bump only when the entry is within this window of expiring.
     pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
 }
-use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 
 /// Maximum number of legs one basket escrow may hold.
 ///

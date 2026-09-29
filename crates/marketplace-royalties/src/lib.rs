@@ -66,8 +66,7 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::{transfer_tokens, ForgeError};
-use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, transfer_tokens, ForgeError};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, Address, Env,
 };
