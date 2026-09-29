@@ -46,6 +46,7 @@
 
 use crate::{SorobanForgeVestingClient, Tranche, Vesting, VestingSchedule, VestingStatus};
 use proptest::prelude::*;
+use std::vec::Vec;
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
@@ -116,7 +117,7 @@ impl World {
 
     /// Create a tranche schedule, funding custody with the table total first
     /// (same mint-then-create shape as the linear fixture helpers).
-    fn create_tranche(&self, tranches: &Vec<Tranche>, total_amount: i128) -> u64 {
+    fn create_tranche(&self, tranches: &soroban_sdk::Vec<Tranche>, total_amount: i128) -> u64 {
         self.mint_to_contract(total_amount);
         self.vesting_client()
             .create_tranche_schedule(&self.beneficiary, &self.token, tranches)
