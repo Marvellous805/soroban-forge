@@ -92,7 +92,9 @@
 extern crate std;
 
 use soroban_forge_shared_utils::{transfer_from_contract, ForgeError};
-use soroban_sdk::{contract, contractclient, contractevent, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractclient, contractevent, contractimpl, contracttype, Address, Env, Vec,
+};
 
 mod events {
     use super::*;
@@ -398,7 +400,7 @@ impl Vesting {
         let id = Self::next_id(&env)?;
         let start = env.ledger().timestamp();
         let mut schedule = VestingSchedule {
-            beneficiary,
+            beneficiary: beneficiary.clone(),
             token,
             total_amount,
             start,
@@ -420,9 +422,10 @@ impl Vesting {
             .get(&DataKey::BeneficiarySchedules(beneficiary.clone()))
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
         schedules.push_back(id);
-        env.storage()
-            .instance()
-            .set(&DataKey::BeneficiarySchedules(beneficiary.clone()), &schedules);
+        env.storage().instance().set(
+            &DataKey::BeneficiarySchedules(beneficiary.clone()),
+            &schedules,
+        );
 
         Ok(id)
     }
