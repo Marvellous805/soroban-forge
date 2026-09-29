@@ -271,9 +271,12 @@ compile_error!(
 #[cfg(test)]
 extern crate std;
 
+use soroban_forge_shared_utils::{
+    transfer_from_contract, transfer_to_contract, ForgeError,
+};
 use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    contract, contractclient, contractevent, contractimpl, contracttype, Address, Bytes,
     Env, IntoVal, Symbol, Val, Vec,
 };
 
@@ -1939,6 +1942,9 @@ impl MultiSigWallet {
     }
 }
 
+/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
+/// it falls inside [`ttl::BUMP_THRESHOLD`]. The standard threshold/extend
+/// pattern: cheap no-op while the entry is fresh, decisive near expiry.
 /// Move `amount` of `token` from `from` into this contract.
 ///
 /// The depositor's `require_auth` on the calling entrypoint covers the

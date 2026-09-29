@@ -125,7 +125,7 @@ treasury at a terminal transition.
 | Metered overage pricing | ✅ Implemented | `base + Σ ceil(min(max(0, units - included), cap) / bucket) * price`, rounded up per bucket, derived per period from raw units so multi-period totals cannot drift; cap enforced by clamping (never rejecting) at settlement; an unrepresentable bill → `ArithmeticOverflow` before any transfer |
 | `cancel` | ✅ Implemented | Subscriber-authorized from `Active` / `Paused` / `PastDue`; rejects already-`Cancelled` |
 | `get_subscription` / `get_subscription_count` / `subscriptions_for_subscriber` / `subscriptions_for_provider` | ✅ Implemented | Read-only views; paged by `offset`/`limit` with `limit == 0` → `InvalidInput`; empty index yields an empty page, not an error |
-| Plan management | ❌ Not implemented | Follow-up |
+| Plan management | ✅ Implemented | `create_plan(provider, token, amount, period, quotas)` → `plan_id`; `subscribe_to_plan(plan_id, subscriber)` → `subscription_id`; `get_plan(plan_id)` → `Plan`; `plan_count()` → `u64`; plan ids from a separate monotonic counter; a subscriber may hold multiple subscriptions to the same plan (each a distinct record); plan quotas copied verbatim into the subscription on join |
 
 ## Marketplace Royalties (`crates/marketplace-royalties`)
 
@@ -153,10 +153,11 @@ treasury at a terminal transition.
 | Events | ✅ Escrow + Multi-Sig + DAO + Marketplace | Full lifecycle events on escrow, multi-sig wallet, DAO governance, and marketplace royalties |
 | Persistent storage + TTL | ✅ Escrow + Royalties + Multi-Sig + DAO | Per-record persistent entries with `touch_ttl`/`touch_tx_ttl` keepers on escrow, marketplace royalties (royalty + summary), multi-sig (transactions), and DAO (proposals); vesting and subscriptions remain instance-only. TTL policy constants + `bump_entry` helper consolidated in shared-utils (issue #127) and consumed by all four |
 | SEP-41 token settlement | ✅ Escrow + royalties + multi-sig + vesting + subscriptions | Real transfers with transfer-before-state ordering on escrow (`deposit`/`release`/`refund`/`resolve`) and vesting (`claim`); marketplace `settle_sale`/`settle_sales`/`distribute` settle splits; DAO `propose` pulls the proposal bond and refunds/forfeits it on settlement; multi-sig `execute` performs cross-contract `try_invoke_contract` calls on opaque payloads; subscriptions still store amounts only |
+| Shared SEP-41 transfer helpers | ✅ `shared-utils` | `transfer_to_contract`, `transfer_from_contract`, and `transfer_tokens` consolidated into `soroban-forge-shared-utils::token`; all settlement crates (escrow, vesting, multi-sig-wallet, marketplace-royalties, dao-governance) call the canonical implementations; local copies deleted; helpers carry unit tests covering both directions and the `TokenTransferFailed` failure path |
 | Testnet deployment | ✅ Escrow deployed | Contract ID, WASM sha256, and receipt rounds in the README "Proof at a glance" table; the other five are not deployed |
 | Mainnet deployment | ⚠️ Partial | Smoke SAC live (`CBBCLWWU…DN4CW`, Horizon-confirmed); escrow WASM upload measured at **17.57 XLM rent** via simulation and deferred pending funding — see [Known Limitations §6](KNOWN-LIMITATIONS.md) |
 | TypeScript SDK | ✅ Generated | `@soroban-forge/escrow-client` generated from the deployed escrow ABI (no own test suite yet) |
-| Provenance + verification | ✅ CLI | `soroban-forge verify` checks a WASM artifact / expected hash against a deterministic rebuild using `provenance-manifest.json` | 
+| Provenance + verification | ✅ CLI | `soroban-forge verify` checks a WASM artifact / expected hash against a deterministic rebuild using `provenance-manifest.json` |
 | `require_auth` on every state change | ✅ Workspace-wide | Escrow, vesting, and DAO governance proven against wrong signers via their negative-auth suites (`authz.rs`) + authorization-tree assertions; other three: call-graph level only (see [Known Limitations §4](KNOWN-LIMITATIONS.md)) |
 | Events | ⚠️ Escrow + Multi-Sig + DAO | Full lifecycle events on escrow, multi-sig wallet, and DAO governance |
 | Persistent storage + TTL | ⚠️ Escrow only | Per-id persistent entries + `touch_ttl` keeper; others instance-only |

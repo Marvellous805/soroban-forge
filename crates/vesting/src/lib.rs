@@ -91,8 +91,8 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_forge_shared_utils::{transfer_from_contract, ForgeError};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env, Vec};
 
 /// Maximum number of tranches a single schedule may carry.
 ///
@@ -716,32 +716,6 @@ impl Vesting {
         unlocked
             .checked_sub(schedule.claimed)
             .ok_or(ForgeError::ArithmeticOverflow)
-    }
-}
-
-/// Move `amount` of `token` from this contract to `to`.
-///
-/// Token failures are bucketed into [`ForgeError::TokenTransferFailed`]
-/// rather than forwarded — the same policy as escrow: a client receiving
-/// `Error(Contract, #N)` cannot know whether `N` came from the token or this
-/// contract, and the root cause remains visible in the transaction's
-/// diagnostic events.
-fn transfer_from_contract(
-    env: &Env,
-    token: &Address,
-    to: &Address,
-    amount: i128,
-) -> Result<(), ForgeError> {
-    match token::TokenClient::new(env, token).try_transfer(
-        &env.current_contract_address(),
-        to,
-        &amount,
-    ) {
-        Ok(Ok(())) => Ok(()),
-        // Token returned a typed error (insufficient balance, custom token
-        // logic) or the host aborted (most commonly an undeployed token
-        // address). The raw discriminant is intentionally discarded.
-        _ => Err(ForgeError::TokenTransferFailed),
     }
 }
 
