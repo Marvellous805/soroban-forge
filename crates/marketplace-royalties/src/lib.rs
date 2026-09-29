@@ -1386,15 +1386,16 @@ mod tests {
                 .set(&DataKey::Royalty(collection.clone()), &disabled);
         });
 
-        // Set active override for token_id to 10% (1_000 bps) to user4
-        client.set_token_royalty(collection, &token_id, &accounts.user3, &1_000_u32);
+        // Set active override for token_id to 10% (1_000 bps) to validator
+        // (distinct from the fixture's seller, who is also user3).
+        client.set_token_royalty(collection, &token_id, &accounts.validator, &1_000_u32);
 
         let settled = client.settle_sale(collection, &token_id, &token, payer, seller, &1_000_i128);
 
         assert_eq!(settled.royalty_share, 100);
         assert_eq!(settled.seller_net, 900);
         assert_eq!(tc.balance(seller), 900);
-        assert_eq!(tc.balance(&accounts.user3), 100);
+        assert_eq!(tc.balance(&accounts.validator), 100);
         assert_eq!(tc.balance(recipient), 0);
     }
 
