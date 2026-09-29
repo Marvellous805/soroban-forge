@@ -379,6 +379,8 @@ pub trait SorobanForgeSubscriptionPayments {
         env: Env,
         subscription_id: u64,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+    /// Permissionlessly extend the persistent subscription record's TTL.
+    fn touch_ttl(env: Env, subscription_id: u64) -> Result<(), ForgeError>;
     /// Total number of subscriptions created so far (read-only view).
     fn get_subscription_count(env: Env) -> u64;
 
@@ -1147,6 +1149,23 @@ impl SubscriptionPayments {
         }
         let elapsed = current_time - subscription.last_charged;
         Ok(elapsed / subscription.period)
+    }
+
+    /// Permissionlessly extend the persistent subscription record's TTL.
+    ///
+    /// Keepers call this to keep idle-but-active subscriptions alive; the
+    /// record must exist or the call fails with `NotFound`.
+    pub fn touch_ttl(env: Env, subscription_id: u64) -> Result<(), ForgeError> {
+        let key = DataKey::Subscription(subscription_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(ForgeError::NotFound);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+        Ok(())
+    }
+
     /// Total number of subscriptions created so far (read-only view).
     ///
     /// This is the monotonic id counter, which only `subscribe` advances, so
@@ -1283,6 +1302,17 @@ impl SubscriptionPayments {
             .persistent()
             .get(&DataKey::Subscription(subscription_id))
             .ok_or(ForgeError::NotFound)
+    }
+
+    /// Write the subscription record to persistent storage and extend its
+    /// TTL in the same touch (write-then-bump, the workspace's keeper-safe
+    /// discipline for long-lived records).
+    fn store_subscription(env: &Env, subscription_id: u64, subscription: &Subscription) {
+        let key = DataKey::Subscription(subscription_id);
+        env.storage().persistent().set(&key, subscription);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
     }
 
     fn get_plan_impl(env: &Env, plan_id: u64) -> Result<Plan, ForgeError> {
@@ -2146,7 +2176,7 @@ mod tests {
 
     #[test]
     fn next_charge_due_returns_expected_time_and_does_not_mutate() {
-        let (env, client, _accounts, subscription_id) = setup!();
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
         let expected = START + PERIOD;
         assert_eq!(client.next_charge_due(&subscription_id), expected);
         
@@ -2169,23 +2199,19 @@ mod tests {
     
     #[test]
     fn next_charge_due_missing_subscription_is_not_found() {
-        let (_env, client, _accounts, _id) = setup!();
+        let (_env, _token, _tc, _contract_id, client, _accounts, _id) = setup!();
         let err = client.try_next_charge_due(&999).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::NotFound);
     }
 
     #[test]
     fn next_charge_due_cancelled_does_not_panic() {
-        let (_env, client, _accounts, subscription_id) = setup!();
+        let (_env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
         client.cancel(&subscription_id);
         assert_eq!(client.next_charge_due(&subscription_id), START + PERIOD);
     }
 
     #[test]
-    fn next_charge_due_overflow_returns_arithmetic_error() {
-        let (env, client, accounts, _id) = setup!();
-        // Subscribe with max period
-        let id = client.subscribe(
     fn get_subscription_count_tracks_creations() {
         let (_env, _token, _tc, _contract_id, client, accounts, _id) = setup!();
         assert_eq!(client.get_subscription_count(), 1);
@@ -2276,7 +2302,7 @@ mod tests {
 
     #[test]
     fn due_periods_tracks_elapsed_time_correctly() {
-        let (env, client, _accounts, subscription_id) = setup!();
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
         
         // Before a period elapses
         env.ledger().set_timestamp(START + PERIOD - 1);
@@ -2293,14 +2319,14 @@ mod tests {
 
     #[test]
     fn due_periods_missing_subscription_is_not_found() {
-        let (_env, client, _accounts, _id) = setup!();
+        let (_env, _token, _tc, _contract_id, client, _accounts, _id) = setup!();
         let err = client.try_due_periods(&999).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::NotFound);
     }
     
     #[test]
     fn due_periods_cancelled_does_not_panic() {
-        let (env, client, _accounts, subscription_id) = setup!();
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
         client.cancel(&subscription_id);
         env.ledger().set_timestamp(START + PERIOD * 3);
         assert_eq!(client.due_periods(&subscription_id), 3);
