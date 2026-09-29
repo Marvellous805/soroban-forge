@@ -1382,7 +1382,7 @@ mod tests {
         };
         env.as_contract(&contract_id, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Royalty(collection.clone()), &disabled);
         });
 
