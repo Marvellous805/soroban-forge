@@ -12,6 +12,7 @@ use soroban_sdk::Env;
 
 pub mod mocks;
 
+pub use mocks::{TestAccounts, TokenFixture};
 pub use mocks::{
     MockTarget, MockTargetClient, RevertingTarget, RevertingTargetClient, TestAccounts,
 };

@@ -209,6 +209,17 @@ pub trait SorobanForgeVesting {
         env: Env,
         schedule_id: u64,
     ) -> Result<VestingStatus, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read all schedule ids belonging to `beneficiary` in creation order (read-only).
+    ///
+    /// Returns an empty list if the beneficiary has no schedules.
+    ///
+    /// *Growth note:* this index lives in instance storage, so its cost scales
+    /// linearly with the number of schedules per beneficiary.
+    fn schedules_for_beneficiary(env: Env, beneficiary: Address) -> soroban_sdk::Vec<u64>;
+
+    /// Read the total number of schedules ever created (read-only).
+    fn schedule_count(env: Env) -> u64;
 }
 
 /// Lifecycle state of a vesting schedule.
@@ -300,6 +311,9 @@ pub struct TrancheSchedule {
 enum DataKey {
     /// The linear vesting record for `u64` id.
     Schedule(u64),
+    /// The list of schedule ids for a given beneficiary.
+    BeneficiarySchedules(Address),
+    /// Monotonic id counter.
     /// The tranche vesting record for `u64` id, unlock table included.
     TrancheSchedule(u64),
     /// Monotonic id counter, shared by both kinds.
@@ -360,6 +374,17 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(id), &schedule);
+
+        let mut schedules: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BeneficiarySchedules(beneficiary.clone()))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        schedules.push_back(id);
+        env.storage()
+            .instance()
+            .set(&DataKey::BeneficiarySchedules(beneficiary), &schedules);
+
         Ok(id)
     }
 
@@ -584,6 +609,19 @@ impl Vesting {
         Ok(total)
     }
 
+    /// Read all schedule ids belonging to `beneficiary` in creation order.
+    pub fn schedules_for_beneficiary(env: Env, beneficiary: Address) -> soroban_sdk::Vec<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::BeneficiarySchedules(beneficiary))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Read the total number of schedules ever created.
+    pub fn schedule_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    }
+
     /// Allocate the next monotonic schedule id.
     fn next_id(env: &Env) -> Result<u64, ForgeError> {
         let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
@@ -725,5 +763,70 @@ mod tests;
 #[cfg(test)]
 mod authz;
 
+        env.ledger().set_timestamp(START + DURATION + 1);
+        let rest = client.claim(&id);
+        assert_eq!(first + rest, TOTAL);
+        assert_eq!(tc.balance(&accounts.user1), TOTAL);
+        assert_eq!(tc.balance(&contract_id), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Enumerable Beneficiary Schedules & Counters
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn schedules_for_beneficiary_returns_empty_when_none() {
+        let (_env, _token, _tc, _cid, client, accounts) = setup!();
+        let schedules = client.schedules_for_beneficiary(&accounts.user2);
+        assert_eq!(schedules.len(), 0);
+    }
+
+    #[test]
+    fn schedule_count_starts_at_zero() {
+        let (_env, _token, _tc, _cid, client, _accounts) = setup!();
+        assert_eq!(client.schedule_count(), 0);
+    }
+
+    #[test]
+    fn schedules_grow_in_creation_order_and_count_matches() {
+        let (_env, token, _tc, _cid, client, accounts) = setup!();
+        let beneficiary = &accounts.user1;
+
+        let id1 = client.create_schedule(beneficiary, &token, &TOTAL, &CLIFF, &DURATION);
+        assert_eq!(client.schedule_count(), 1);
+        let s1 = client.schedules_for_beneficiary(beneficiary);
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1.get(0).unwrap(), id1);
+
+        let id2 = client.create_schedule(beneficiary, &token, &TOTAL, &CLIFF, &DURATION);
+        assert_eq!(client.schedule_count(), 2);
+        let s2 = client.schedules_for_beneficiary(beneficiary);
+        assert_eq!(s2.len(), 2);
+        assert_eq!(s2.get(0).unwrap(), id1);
+        assert_eq!(s2.get(1).unwrap(), id2);
+    }
+
+    #[test]
+    fn schedules_for_distinct_beneficiaries_are_disjoint() {
+        let (_env, token, _tc, _cid, client, accounts) = setup!();
+        let b1 = &accounts.user1;
+        let b2 = &accounts.user2;
+
+        let id1 = client.create_schedule(b1, &token, &TOTAL, &CLIFF, &DURATION);
+        let id2 = client.create_schedule(b2, &token, &TOTAL, &CLIFF, &DURATION);
+        let id3 = client.create_schedule(b1, &token, &TOTAL, &CLIFF, &DURATION);
+
+        let s1 = client.schedules_for_beneficiary(b1);
+        let s2 = client.schedules_for_beneficiary(b2);
+
+        assert_eq!(client.schedule_count(), 3);
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s1.get(0).unwrap(), id1);
+        assert_eq!(s1.get(1).unwrap(), id3);
+
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2.get(0).unwrap(), id2);
+    }
+}
 #[cfg(test)]
 mod props;

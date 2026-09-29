@@ -360,6 +360,25 @@ pub trait SorobanForgeSubscriptionPayments {
         subscription_id: u64,
     ) -> Result<Subscription, soroban_forge_shared_utils::ForgeError>;
 
+    /// Read the timestamp when the next charge is due.
+    ///
+    /// This queries the configured schedule (`last_charged + period`) and works
+    /// deterministically regardless of the subscription's `status` (including
+    /// `Cancelled` subscriptions).
+    fn next_charge_due(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read how many full periods have elapsed since the last charge.
+    ///
+    /// This returns `0` before a full period elapses. Like `next_charge_due`,
+    /// this query ignores the subscription's `status` and works identically
+    /// for `Cancelled` subscriptions.
+    fn due_periods(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
     /// Total number of subscriptions created so far (read-only view).
     fn get_subscription_count(env: Env) -> u64;
 
@@ -1114,6 +1133,24 @@ impl SubscriptionPayments {
         Self::get_subscription_impl(&env, subscription_id)
     }
 
+    /// Read the timestamp when the next charge is due (read-only view).
+    pub fn next_charge_due(env: Env, subscription_id: u64) -> Result<u64, ForgeError> {
+        let subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        subscription
+            .last_charged
+            .checked_add(subscription.period)
+            .ok_or(ForgeError::ArithmeticOverflow)
+    }
+
+    /// Read how many full periods have elapsed since the last charge (read-only view).
+    pub fn due_periods(env: Env, subscription_id: u64) -> Result<u64, ForgeError> {
+        let subscription = Self::get_subscription_impl(&env, subscription_id)?;
+        let current_time = env.ledger().timestamp();
+        if current_time < subscription.last_charged {
+            return Ok(0);
+        }
+        let elapsed = current_time - subscription.last_charged;
+        Ok(elapsed / subscription.period)
     /// Total number of subscriptions created so far (read-only view).
     ///
     /// This is the monotonic id counter, which only `subscribe` advances, so
@@ -2111,6 +2148,47 @@ mod tests {
     }
 
     #[test]
+    fn next_charge_due_returns_expected_time_and_does_not_mutate() {
+        let (env, client, _accounts, subscription_id) = setup!();
+        let expected = START + PERIOD;
+        assert_eq!(client.next_charge_due(&subscription_id), expected);
+        
+        // Mutate-check
+        let before = client.get_subscription(&subscription_id);
+        client.next_charge_due(&subscription_id);
+        let after = client.get_subscription(&subscription_id);
+        assert_eq!(before.last_charged, after.last_charged);
+        
+        // Stable across before-due time
+        env.ledger().set_timestamp(START + PERIOD - 1);
+        assert_eq!(client.charge(&subscription_id), 0);
+        assert_eq!(client.next_charge_due(&subscription_id), expected);
+        
+        // Advances exactly by one period after a charge
+        env.ledger().set_timestamp(START + PERIOD);
+        client.charge(&subscription_id);
+        assert_eq!(client.next_charge_due(&subscription_id), expected + PERIOD);
+    }
+    
+    #[test]
+    fn next_charge_due_missing_subscription_is_not_found() {
+        let (_env, client, _accounts, _id) = setup!();
+        let err = client.try_next_charge_due(&999).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn next_charge_due_cancelled_does_not_panic() {
+        let (_env, client, _accounts, subscription_id) = setup!();
+        client.cancel(&subscription_id);
+        assert_eq!(client.next_charge_due(&subscription_id), START + PERIOD);
+    }
+
+    #[test]
+    fn next_charge_due_overflow_returns_arithmetic_error() {
+        let (env, client, accounts, _id) = setup!();
+        // Subscribe with max period
+        let id = client.subscribe(
     fn get_subscription_count_tracks_creations() {
         let (_env, _token, _tc, _contract_id, client, accounts, _id) = setup!();
         assert_eq!(client.get_subscription_count(), 1);
@@ -2193,6 +2271,42 @@ mod tests {
             &accounts.validator,
             &accounts.deployer,
             &AMOUNT,
+            &u64::MAX,
+        );
+        let err = client.try_next_charge_due(&id).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn due_periods_tracks_elapsed_time_correctly() {
+        let (env, client, _accounts, subscription_id) = setup!();
+        
+        // Before a period elapses
+        env.ledger().set_timestamp(START + PERIOD - 1);
+        assert_eq!(client.due_periods(&subscription_id), 0);
+
+        // Exactly at due
+        env.ledger().set_timestamp(START + PERIOD);
+        assert_eq!(client.due_periods(&subscription_id), 1);
+
+        // After due (e.g. 2.5 periods)
+        env.ledger().set_timestamp(START + PERIOD * 2 + PERIOD / 2);
+        assert_eq!(client.due_periods(&subscription_id), 2);
+    }
+
+    #[test]
+    fn due_periods_missing_subscription_is_not_found() {
+        let (_env, client, _accounts, _id) = setup!();
+        let err = client.try_due_periods(&999).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+    
+    #[test]
+    fn due_periods_cancelled_does_not_panic() {
+        let (env, client, _accounts, subscription_id) = setup!();
+        client.cancel(&subscription_id);
+        env.ledger().set_timestamp(START + PERIOD * 3);
+        assert_eq!(client.due_periods(&subscription_id), 3);
             &PERIOD,
         );
 
