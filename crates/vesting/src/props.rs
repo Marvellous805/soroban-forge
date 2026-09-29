@@ -230,7 +230,7 @@ fn arb_tranche_table() -> impl Strategy<Value = Vec<(u64, i128)>> {
             let cap = MAX_AMOUNT / n as i128;
             strictly_increasing_offsets(n as usize, 0, MAX_DURATION).prop_flat_map(move |offsets| {
                 positive_amounts(n as usize, cap)
-                    .prop_map(move |amounts| offsets.into_iter().zip(amounts).collect())
+                    .prop_map(move |amounts| offsets.clone().into_iter().zip(amounts).collect())
             })
         }),
         2 => (1u32..=MAX_TRANCHES).prop_flat_map(|n| {
@@ -238,7 +238,7 @@ fn arb_tranche_table() -> impl Strategy<Value = Vec<(u64, i128)>> {
             strictly_increasing_offsets(n as usize - 1, 1, MAX_DURATION).prop_flat_map(move |offsets| {
                 positive_amounts(n as usize, cap).prop_map(move |amounts| {
                     let mut table = vec![(0u64, amounts[0])];
-                    for (i, offset) in offsets.into_iter().enumerate() {
+                    for (i, offset) in offsets.clone().into_iter().enumerate() {
                         table.push((offset, amounts[i + 1]));
                     }
                     table
@@ -250,7 +250,7 @@ fn arb_tranche_table() -> impl Strategy<Value = Vec<(u64, i128)>> {
             strictly_increasing_offsets(n as usize - 1, 0, MAX_DURATION).prop_flat_map(move |offsets| {
                 positive_amounts(n as usize, cap).prop_map(move |amounts| {
                     let mut table: Vec<(u64, i128)> =
-                        offsets.into_iter().zip(amounts.iter().cloned()).collect();
+                        offsets.clone().into_iter().zip(amounts.iter().cloned()).collect();
                     table.push((u64::MAX, *amounts.last().unwrap()));
                     table
                 })
@@ -261,7 +261,7 @@ fn arb_tranche_table() -> impl Strategy<Value = Vec<(u64, i128)>> {
             strictly_increasing_offsets(n as usize - 2, 1, MAX_DURATION).prop_flat_map(move |offsets| {
                 positive_amounts(n as usize, cap).prop_map(move |amounts| {
                     let mut table = vec![(0u64, amounts[0])];
-                    for (i, offset) in offsets.into_iter().enumerate() {
+                    for (i, offset) in offsets.clone().into_iter().enumerate() {
                         table.push((offset, amounts[i + 1]));
                     }
                     table.push((u64::MAX, amounts[amounts.len() - 1]));
@@ -273,7 +273,7 @@ fn arb_tranche_table() -> impl Strategy<Value = Vec<(u64, i128)>> {
             let cap = i128::MAX / n as i128;
             strictly_increasing_offsets(n as usize, 0, MAX_DURATION).prop_flat_map(move |offsets| {
                 positive_amounts(n as usize, cap)
-                    .prop_map(move |amounts| offsets.into_iter().zip(amounts).collect())
+                    .prop_map(move |amounts| offsets.clone().into_iter().zip(amounts).collect())
             })
         }),
     ]
