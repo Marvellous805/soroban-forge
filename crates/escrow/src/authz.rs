@@ -38,7 +38,7 @@
 //!   *buyer* (not the executing contract) and so is a real, matchable
 //!   sub-invocation.
 
-use crate::{Escrow, EscrowStatus, SorobanForgeEscrowClient};
+use crate::{Escrow, EscrowAsset, EscrowStatus, SorobanForgeEscrowClient};
 use soroban_forge_shared_utils::ForgeError;
 // The test harness links std even in a no_std crate; AuthorizedInvocation's
 // sub_invocations field is a std Vec, so re-expose std here for `vec!`.
@@ -47,7 +47,7 @@ use soroban_sdk::testutils::{
     Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _, MockAuth, MockAuthInvoke,
 };
 use soroban_sdk::token::StellarAssetClient;
-use soroban_sdk::{Address, Env, IntoVal, InvokeError, Symbol};
+use soroban_sdk::{Address, Env, IntoVal, InvokeError, Symbol, Vec};
 
 const START: u64 = 1_000_000;
 const TIMEOUT: u64 = 1_000;
@@ -75,6 +75,61 @@ macro_rules! setup {
 
         (env, token, token_client, contract_id, client, accounts)
     }};
+}
+
+/// Fresh env with **two** mintable SAC tokens for the basket paths. Setup runs
+/// under blanket mocking; the tested call re-arms the envelope afterwards.
+macro_rules! setup_basket {
+    () => {{
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(START);
+
+        let admin = Address::generate(&env);
+        let sac_a = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_a = sac_a.address();
+        let token_a_admin = StellarAssetClient::new(&env, &token_a);
+        let token_a_client = soroban_sdk::token::Client::new(&env, &token_a);
+
+        let sac_b = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_b = sac_b.address();
+        let token_b_admin = StellarAssetClient::new(&env, &token_b);
+        let token_b_client = soroban_sdk::token::Client::new(&env, &token_b);
+
+        let contract_id = env.register(Escrow, ());
+        let client = SorobanForgeEscrowClient::new(&env, &contract_id);
+
+        let accounts = soroban_forge_test_utils::TestAccounts::generate(&env);
+        token_a_admin.mint(&accounts.user1, &AMOUNT);
+        token_b_admin.mint(&accounts.user1, &AMOUNT);
+
+        (
+            env,
+            token_a,
+            token_b,
+            token_a_client,
+            token_b_client,
+            contract_id,
+            client,
+            accounts,
+        )
+    }};
+}
+
+/// Two-leg basket assets: `AMOUNT` of each of `token_a` and `token_b`.
+fn basket_assets(env: &Env, token_a: &Address, token_b: &Address) -> Vec<EscrowAsset> {
+    let mut assets = Vec::new(env);
+    assets.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount: AMOUNT,
+        released: 0,
+    });
+    assets.push_back(EscrowAsset {
+        token: token_b.clone(),
+        amount: AMOUNT,
+        released: 0,
+    });
+    assets
 }
 
 /// Args of the nested SAC `transfer` frame the contract performs.
@@ -863,4 +918,468 @@ fn release_partial_mutation_test_no_auth_aborts() {
         .expect("outer ok")
         .expect("seller auth must succeed after auth is restored");
     assert_eq!(tc.balance(seller), AMOUNT / 2);
+}
+
+// -----------------------------------------------------------------------
+// Baskets — negative authorization for every entrypoint
+// -----------------------------------------------------------------------
+
+#[test]
+fn create_basket_accepts_buyer_signature_with_matching_assets() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+
+    // The buyer authorizes create_basket with the exact basket terms; the
+    // assets vector must be part of the approved invocation, not just a
+    // signature over the parties.
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "create_basket",
+            args: (buyer, seller, arbiter, &assets, TIMEOUT).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let id = client
+        .try_create_basket(buyer, seller, arbiter, &assets, &TIMEOUT)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
+}
+
+#[test]
+fn create_basket_rejects_signature_from_non_buyer() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "create_basket",
+            args: (buyer, seller, arbiter, &assets, TIMEOUT).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn create_basket_rejects_signature_over_different_basket_terms() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    // A different basket: leg B carries a raised amount. A captured buyer
+    // signature must not be replayable over changed terms.
+    let mut changed = Vec::new(&env);
+    changed.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount: AMOUNT,
+        released: 0,
+    });
+    changed.push_back(EscrowAsset {
+        token: token_b.clone(),
+        amount: AMOUNT + 500,
+        released: 0,
+    });
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "create_basket",
+            args: (buyer, seller, arbiter, &changed, TIMEOUT).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn deposit_basket_accepts_buyer_chain_authorizing_every_leg() {
+    // The deposit asks the buyer to sign *once per leg*: the entrypoint frame
+    // plus two nested SAC `transfer` pulls, one per token, in pull order. With
+    // all three armed the deposit must land.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "deposit_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[
+                MockAuthInvoke {
+                    contract: &token_a,
+                    fn_name: "transfer",
+                    args: transfer_args(&env, buyer, &contract_id, AMOUNT),
+                    sub_invokes: &[],
+                },
+                MockAuthInvoke {
+                    contract: &token_b,
+                    fn_name: "transfer",
+                    args: transfer_args(&env, buyer, &contract_id, AMOUNT),
+                    sub_invokes: &[],
+                },
+            ],
+        },
+    }]);
+
+    client.try_deposit_basket(&id).expect("outer ok").unwrap();
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn deposit_basket_rejects_missing_leg_authorization_without_partial_custody() {
+    // Only leg A's transfer is armed. Leg B's pull has no authorization, so
+    // the token layer rejects it; the host frame must roll back leg A too —
+    // custody must not hold half a basket on a partial authorization.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "deposit_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &token_a,
+                fn_name: "transfer",
+                args: transfer_args(&env, buyer, &contract_id, AMOUNT),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+
+    let res = client.try_deposit_basket(&id);
+    assert!(
+        matches!(res, Err(Ok(ForgeError::TokenTransferFailed))),
+        "missing leg auth surfaces as the token-layer error"
+    );
+    assert_eq!(tc_a.balance(&contract_id), 0, "leg A must roll back too");
+    assert_eq!(tc_b.balance(&contract_id), 0, "leg B must never land");
+    assert_eq!(tc_a.balance(buyer), AMOUNT, "buyer's token A untouched");
+    assert_eq!(tc_b.balance(buyer), AMOUNT, "buyer's token B untouched");
+    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
+}
+
+#[test]
+fn release_basket_rejects_buyer_signature() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_basket(&id);
+    assert_auth_abort!(res);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn release_basket_authorization_tree_is_seller_only() {
+    // Same shape as the single-token release: the seller's entrypoint frame
+    // is the only entry, because contract self-auth for the outgoing payouts
+    // is implicit and not recorded.
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.release_basket(&id);
+
+    assert_eq!(
+        env.auths(),
+        [(
+            seller.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract_id.clone(),
+                    Symbol::new(&env, "release_basket"),
+                    (id,).into_val(&env),
+                )),
+                // Self-auth implicit — entrypoint frame only.
+                sub_invocations: std::vec![],
+            },
+        )],
+    );
+}
+
+#[test]
+fn release_partial_basket_rejects_non_seller() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial_basket",
+            args: (id, token_a.clone(), AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_partial_basket(&id, &token_a, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn release_partial_basket_rejects_signature_over_other_leg() {
+    // The seller signs for leg B, but the invocation pays leg A. The leg
+    // identity is part of the approved invocation; a signed leg B must not
+    // authorize a leg A payout.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial_basket",
+            args: (id, token_b.clone(), AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_partial_basket(&id, &token_a, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn refund_basket_pre_deadline_rejects_buyer_signature() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    // Before the deadline only the seller may refund. The buyer's own
+    // signature must be rejected.
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "refund_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_refund_basket(&id);
+    assert_auth_abort!(res);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn refund_basket_post_deadline_rejects_seller_signature() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "refund_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_refund_basket(&id);
+    assert_auth_abort!(res);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn dispute_basket_rejects_seller_signing_as_buyer_claimant() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    // The seller signs a call whose claimant is the buyer: the signature
+    // exists but belongs to the wrong address for the claimed identity.
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "dispute_basket",
+            args: (id, buyer).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_dispute_basket(&id, buyer);
+    assert_auth_abort!(res);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn resolve_basket_rejects_party_signature_and_ships_arbiter_tree() {
+    // A party (buyer) signs the resolve: must abort, custody untouched.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+    client.dispute_basket(&id, buyer);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "resolve_basket",
+            args: (id, true).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_resolve_basket(&id, &true);
+    assert_auth_abort!(res);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Disputed);
+
+    // The arbiter's signature alone completes it, and the recorded tree is
+    // the arbiter's entrypoint frame only (self-auth implicit).
+    env.mock_auths(&[MockAuth {
+        address: arbiter,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "resolve_basket",
+            args: (id, true).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client
+        .try_resolve_basket(&id, &true)
+        .expect("outer ok")
+        .unwrap();
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+}
+
+#[test]
+fn cancel_basket_accepts_buyer_rejects_seller() {
+    let (env, token_a, token_b, _tc_a, _tc_b, contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "cancel_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_cancel_basket(&id);
+    assert_auth_abort!(res);
+    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
+
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "cancel_basket",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.try_cancel_basket(&id).expect("outer ok").unwrap();
+    assert_eq!(client.get_status(&id), EscrowStatus::Cancelled);
+}
+
+#[test]
+fn blank_envelope_aborts_basket_create_and_writes_nothing() {
+    let (env, token_a, token_b, _tc_a, _tc_b, _contract_id, client, accounts) = setup_basket!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let assets = basket_assets(&env, &token_a, &token_b);
+
+    env.set_auths(&[]);
+
+    let res = client.try_create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    assert_auth_abort!(res);
+    // The id counter must not have advanced: the next escrow is id 1.
+    env.mock_all_auths();
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    assert_eq!(id, 1);
 }

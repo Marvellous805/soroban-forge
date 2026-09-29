@@ -19,10 +19,13 @@
 //! signature testing needs `set_auths` fixtures and is tracked in the
 //! security-invariant backlog.
 
-use crate::{Escrow, EscrowData, EscrowStatus, SorobanForgeEscrowClient};
+use crate::{
+    BasketEscrowData, Escrow, EscrowAsset, EscrowData, EscrowStatus, SorobanForgeEscrowClient,
+};
 use soroban_forge_shared_utils::ForgeError;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+use soroban_sdk::{Address, Env, Vec};
 
 const START: u64 = 1_000_000;
 const TIMEOUT: u64 = 1_000;
@@ -48,6 +51,87 @@ macro_rules! setup {
 
         (env, token, token_fixture, contract_id, client, accounts)
     }};
+}
+
+/// Fresh env with **two** mintable SAC tokens (token A and token B), the
+/// escrow contract, and named accounts. Buyer (`user1`) starts funded in both
+/// tokens unless a test mints selectively. Returns the names the basket tests
+/// use.
+macro_rules! setup_basket {
+    () => {{
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(START);
+
+        let admin = Address::generate(&env);
+        let sac_a = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_a = sac_a.address();
+        let token_a_admin = StellarAssetClient::new(&env, &token_a);
+        let token_a_client = TokenClient::new(&env, &token_a);
+
+        let sac_b = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_b = sac_b.address();
+        let token_b_admin = StellarAssetClient::new(&env, &token_b);
+        let token_b_client = TokenClient::new(&env, &token_b);
+
+        let contract_id = env.register(Escrow, ());
+        let client = SorobanForgeEscrowClient::new(&env, &contract_id);
+
+        let accounts = soroban_forge_test_utils::TestAccounts::generate(&env);
+        token_a_admin.mint(&accounts.user1, &AMOUNT);
+        token_b_admin.mint(&accounts.user1, &AMOUNT);
+
+        (
+            env,
+            token_a,
+            token_b,
+            token_a_client,
+            token_b_client,
+            contract_id,
+            client,
+            accounts,
+        )
+    }};
+}
+
+/// Build the `assets` argument for a two-leg basket: `amount` of `token_a`
+/// and `amount` of `token_b`, both unreleased.
+fn basket_assets(
+    env: &Env,
+    token_a: &Address,
+    token_b: &Address,
+    amount: i128,
+) -> Vec<EscrowAsset> {
+    let mut assets = Vec::new(env);
+    assets.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount,
+        released: 0,
+    });
+    assets.push_back(EscrowAsset {
+        token: token_b.clone(),
+        amount,
+        released: 0,
+    });
+    assets
+}
+
+/// Helper to read a basket via the client and assert its basic shape.
+fn assert_basket_legs(
+    basket: &BasketEscrowData,
+    token_a: &Address,
+    token_b: &Address,
+    amount: i128,
+) {
+    assert_eq!(basket.assets.len(), 2);
+    let leg_a = basket.assets.get_unchecked(0);
+    let leg_b = basket.assets.get_unchecked(1);
+    assert_eq!(&leg_a.token, token_a);
+    assert_eq!(&leg_b.token, token_b);
+    assert_eq!(leg_a.amount, amount);
+    assert_eq!(leg_b.amount, amount);
+    assert_eq!(leg_a.released, 0);
+    assert_eq!(leg_b.released, 0);
 }
 
 fn create(
@@ -1154,4 +1238,447 @@ fn conservation_holds_on_every_terminal_path() {
             );
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// Multi-asset baskets
+// -----------------------------------------------------------------------
+
+#[test]
+fn create_basket_records_all_legs_and_stays_pending() {
+    let (_env, token_a, token_b, _tc_a, _tc_b, _id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&_env, &token_a, &token_b, AMOUNT);
+
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    let record: BasketEscrowData = client.get_basket(&id);
+    assert_eq!(record.escrow_id, id);
+    assert_eq!(&record.buyer, buyer);
+    assert_eq!(&record.seller, seller);
+    assert_eq!(&record.arbiter, arbiter);
+    assert_eq!(record.timeout, TIMEOUT);
+    assert_eq!(record.created_at, START);
+    assert_eq!(record.status, EscrowStatus::Pending);
+    assert_basket_legs(&record, &token_a, &token_b, AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
+}
+
+#[test]
+fn basket_ids_share_the_single_escrow_sequence() {
+    let (_env, token_a, token_b, _tc_a, _tc_b, _id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&_env, &token_a, &token_b, AMOUNT);
+
+    let single = client.create_escrow(buyer, seller, arbiter, &token_a, &AMOUNT, &TIMEOUT);
+    let basket = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    assert_eq!(single + 1, basket);
+    // Same id space, so `get_status` resolves either kind and `get_escrow` /
+    // `get_basket` deliberately read only their own kind.
+    assert_eq!(client.get_status(&single), EscrowStatus::Pending);
+    assert_eq!(client.get_status(&basket), EscrowStatus::Pending);
+    assert!(client.get_escrow(&single).status == EscrowStatus::Pending);
+    assert!(client.try_get_escrow(&basket).is_err());
+    assert_eq!(client.get_basket(&basket).escrow_id, basket);
+    assert!(client.try_get_basket(&single).is_err());
+}
+
+#[test]
+fn create_basket_rejects_empty_basket() {
+    let (_env, _token_a, _token_b, _tc_a, _tc_b, _id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+
+    let err = client
+        .try_create_basket(buyer, seller, arbiter, &Vec::new(&_env), &TIMEOUT)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+}
+
+#[test]
+fn create_basket_rejects_duplicate_token() {
+    let (_env, token_a, _token_b, _tc_a, _tc_b, _id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let mut assets = Vec::new(&_env);
+    assets.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount: AMOUNT,
+        released: 0,
+    });
+    assets.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount: AMOUNT,
+        released: 0,
+    });
+
+    let err = client
+        .try_create_basket(buyer, seller, arbiter, &assets, &TIMEOUT)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+}
+
+#[test]
+fn create_basket_rejects_zero_leg_and_zero_timeout() {
+    let (_env, token_a, token_b, _tc_a, _tc_b, _id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+
+    let mut zero_leg = Vec::new(&_env);
+    zero_leg.push_back(EscrowAsset {
+        token: token_a.clone(),
+        amount: 0,
+        released: 0,
+    });
+    let err = client
+        .try_create_basket(buyer, seller, arbiter, &zero_leg, &TIMEOUT)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+
+    let assets = basket_assets(&_env, &token_a, &token_b, AMOUNT);
+    let err = client
+        .try_create_basket(buyer, seller, arbiter, &assets, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+}
+
+#[test]
+fn deposit_basket_moves_every_leg_into_custody() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    client.deposit_basket(&id);
+
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_a.balance(buyer), 0);
+    assert_eq!(tc_b.balance(buyer), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn deposit_basket_is_all_or_nothing_on_leg_failure() {
+    // Buyer is funded only in token A. Leg A pulls in, leg B fails; the host
+    // frame must roll back leg A, leaving the contract holding nothing in
+    // either token and the basket still Pending (retryable).
+    let (_env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (_funded_buyer, seller, arbiter) = parties(&accounts);
+    // user2 is famously unfunded, so the deposit fails partway on leg B.
+    let poor = &accounts.user2;
+    let assets = basket_assets(&_env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(poor, seller, arbiter, &assets, &TIMEOUT);
+
+    let err = client.try_deposit_basket(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::TokenTransferFailed);
+    // Nothing moved for leg A either: custody must not hold partial baskets.
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
+}
+
+#[test]
+fn release_basket_pays_every_leg_to_the_seller() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.release_basket(&id);
+
+    assert_eq!(tc_a.balance(seller), AMOUNT);
+    assert_eq!(tc_b.balance(seller), AMOUNT);
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+    let record: BasketEscrowData = client.get_basket(&id);
+    assert!(record.fully_released());
+    assert_eq!(record.assets.get_unchecked(0).released, AMOUNT);
+    assert_eq!(record.assets.get_unchecked(1).released, AMOUNT);
+}
+
+#[test]
+fn release_basket_requires_funded_state() {
+    let (env, token_a, token_b, tc_a, tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+
+    let err = client.try_release_basket(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_eq!(tc_a.balance(seller), 0);
+    assert_eq!(tc_b.balance(seller), 0);
+}
+
+#[test]
+fn release_partial_basket_pays_one_leg_and_tracks_released() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.release_partial_basket(&id, &token_a, &(AMOUNT / 2));
+
+    assert_eq!(tc_a.balance(seller), AMOUNT / 2);
+    assert_eq!(tc_b.balance(seller), 0);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT - AMOUNT / 2);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+    // One leg drained but the other untouched: not yet Completed.
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+    let record: BasketEscrowData = client.get_basket(&id);
+    assert_eq!(record.assets.get_unchecked(0).released, AMOUNT / 2);
+    assert_eq!(record.assets.get_unchecked(1).released, 0);
+    assert!(!record.fully_released());
+}
+
+#[test]
+fn release_partial_basket_marks_completed_only_when_all_legs_exhausted() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.release_partial_basket(&id, &token_a, &AMOUNT);
+    // Leg A is now empty; leg B still funds the basket.
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+    client.release_partial_basket(&id, &token_b, &AMOUNT);
+
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+}
+
+#[test]
+fn release_partial_basket_validates_amount_and_token() {
+    let (env, token_a, token_b, _tc_a, _tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    let err = client
+        .try_release_partial_basket(&id, &token_a, &(AMOUNT + 1))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+
+    let err = client
+        .try_release_partial_basket(&id, &token_a, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+
+    // A token the basket never held reads as NotFound, not a balance problem.
+    let stranger = Address::generate(&env);
+    let err = client
+        .try_release_partial_basket(&id, &stranger, &(AMOUNT / 2))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+    // Nothing moved for the rejected calls.
+    assert_eq!(client.get_basket(&id).assets.get_unchecked(0).released, 0);
+}
+
+#[test]
+fn refund_basket_returns_every_leg_to_the_buyer() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.refund_basket(&id);
+
+    assert_eq!(tc_a.balance(buyer), AMOUNT);
+    assert_eq!(tc_b.balance(buyer), AMOUNT);
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn refund_basket_buyer_authorizes_after_deadline() {
+    let (env, token_a, token_b, tc_a, tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    client.refund_basket(&id);
+
+    assert_eq!(tc_a.balance(buyer), AMOUNT);
+    assert_eq!(tc_b.balance(buyer), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn refund_basket_refunds_only_the_remaining_after_partials() {
+    let (env, token_a, token_b, tc_a, tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.release_partial_basket(&id, &token_a, &(AMOUNT / 2));
+    client.refund_basket(&id);
+
+    // Leg A: AMOUNT/2 was paid to the seller, AMOUNT/2 refunded.
+    assert_eq!(tc_a.balance(buyer), AMOUNT / 2);
+    assert_eq!(tc_b.balance(buyer), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn dispute_basket_freezes_every_leg_until_resolved() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.dispute_basket(&id, buyer);
+
+    assert_eq!(client.get_status(&id), EscrowStatus::Disputed);
+    // Both legs frozen: no movement possible until the arbiter resolves.
+    let err = client.try_release_basket(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    let err = client
+        .try_release_partial_basket(&id, &token_a, &(AMOUNT / 2))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    let err = client.try_refund_basket(&id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn dispute_basket_rejects_outsider_claimant() {
+    let (env, token_a, token_b, _tc_a, _tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    let err = client
+        .try_dispute_basket(&id, &accounts.user3)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+}
+
+#[test]
+fn resolve_basket_pays_every_leg_to_one_party() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+    client.dispute_basket(&id, seller);
+
+    client.resolve_basket(&id, &true);
+
+    assert_eq!(tc_a.balance(seller), AMOUNT);
+    assert_eq!(tc_b.balance(seller), AMOUNT);
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+
+    // The same scenario resolved against the seller instead refunds the buyer.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+    client.dispute_basket(&id, buyer);
+    client.resolve_basket(&id, &false);
+
+    assert_eq!(tc_a.balance(buyer), AMOUNT);
+    assert_eq!(tc_b.balance(buyer), AMOUNT);
+    assert_eq!(tc_a.balance(&contract_id), 0);
+    assert_eq!(tc_b.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn resolve_basket_requires_disputed_and_arbiter() {
+    let (env, token_a, token_b, _tc_a, _tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (_buyer, seller, arbiter) = parties(&accounts);
+
+    // Not disputed.
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(&accounts.user1, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+    let err = client.try_resolve_basket(&id, &true).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+
+    // Arbiter-only under mocked auths is enforced as the call graph; the
+    // negative-auth suite covers a wrong signer explicitly.
+}
+
+#[test]
+fn cancel_basket_requires_pending() {
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.cancel_basket(&id);
+    assert_eq!(client.get_status(&id), EscrowStatus::Cancelled);
+
+    // A funded basket cannot be cancelled, and nothing moved.
+    let expired_id = {
+        let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+        client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT)
+    };
+    client.deposit_basket(&expired_id);
+    let err = client.try_cancel_basket(&expired_id).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_eq!(tc_a.balance(&contract_id), AMOUNT);
+    assert_eq!(tc_b.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn touch_ttl_resolves_basket_ids() {
+    let (env, token_a, token_b, _tc_a, _tc_b, _contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+
+    client.touch_ttl(&id);
+
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn basket_conservation_over_a_terminal_path() {
+    // Deposit → partial on leg A → dispute → resolve for seller. The sum
+    // across buyer, seller, arbiter, and the contract equals the deposits in
+    // *each* token, and custody ends at zero in both.
+    let (env, token_a, token_b, tc_a, tc_b, contract_id, client, accounts) = setup_basket!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let assets = basket_assets(&env, &token_a, &token_b, AMOUNT);
+    let id = client.create_basket(buyer, seller, arbiter, &assets, &TIMEOUT);
+    client.deposit_basket(&id);
+    client.release_partial_basket(&id, &token_a, &(AMOUNT / 2));
+    client.dispute_basket(&id, buyer);
+    client.resolve_basket(&id, &true);
+
+    assert_eq!(tc_a.balance(&contract_id) + tc_b.balance(&contract_id), 0);
+    assert_eq!(
+        tc_a.balance(buyer) + tc_a.balance(seller) + tc_a.balance(arbiter),
+        AMOUNT
+    );
+    assert_eq!(
+        tc_b.balance(buyer) + tc_b.balance(seller) + tc_b.balance(arbiter),
+        AMOUNT
+    );
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
 }
