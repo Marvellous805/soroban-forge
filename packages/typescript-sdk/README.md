@@ -9,6 +9,30 @@ The client is generated from the deployed contract's ABI by the Stellar CLI, so
 every method is fully typed and carries the doc comments from the contract
 source.
 
+## Error codes
+
+Contract errors returned by the client use the shared `ForgeError` codes:
+
+| Code | Variant | Meaning |
+|---:|---|---|
+| 1 | `Unauthorized` | The caller is not permitted to perform this action. |
+| 2 | `NotFound` | The requested entity does not exist. |
+| 3 | `InvalidInput` | One or more arguments failed validation. |
+| 4 | `InsufficientFunds` | The contract does not hold enough balance to satisfy the operation. |
+| 5 | `AlreadyInitialized` | The entity was already initialized; re-initialization is rejected. |
+| 6 | `NotInitialized` | The entity was expected to be initialized but was not. |
+| 7 | `DeadlineReached` | The operation was attempted after its deadline elapsed. |
+| 8 | `InsufficientAllowance` | A required token allowance was lower than the amount being spent. |
+| 9 | `ArithmeticOverflow` | An arithmetic operation overflowed. |
+| 10 | `Custom` | A contract-specific error that does not map to the other categories. |
+| 11 | `TokenTransferFailed` | A SEP-41 token invocation failed; the raw token error is bucketed, with the cause available in transaction diagnostic events. |
+| 12 | `ContractInvocationFailed` | A cross-contract invocation failed; the invoking transaction remains un-executed. |
+| 13 | `WithdrawalLimitExceeded` | The withdrawal would exceed the token's configured rolling-window limit. |
+| 14 | `SubscriptionPastDue` | The subscription is lapsed; a catch-up charge must restore it to `Active` before the operation can proceed. |
+| 15 | `ProposerCooldown` | The proposer reached the maximum concurrent active proposals or is within the cooldown window. |
+
+The canonical error list is maintained in [`crates/shared-utils/src/errors.rs`](../../crates/shared-utils/src/errors.rs); update this table when that definition changes.
+
 ## Install
 
 ```bash
