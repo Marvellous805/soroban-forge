@@ -164,7 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-crate `Env`-based tests.
 - **DAO governance contract** (implemented): `propose`, `vote`, `execute`, and
   `get_proposal` with voting deadlines, one-vote-per-voter enforcement,
-  majority finalisation, and 16 in-crate `Env`-based tests.
+  majority finalization, and 16 in-crate `Env`-based tests.
 - **Subscription payments contract** (implemented): `subscribe`, `charge`,
   `cancel`, and `get_subscription` with period-based billing that catches up
   one period per call, and 12 in-crate `Env`-based tests.

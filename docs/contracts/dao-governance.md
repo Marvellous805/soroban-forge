@@ -30,8 +30,8 @@ voting; a second call returns `ForgeError::AlreadyInitialized`. `action` is
 forwarded as a single `Bytes` argument to the target contract's `execute`
 entrypoint. Each voter may vote once, and the current governance-token
 balance at vote time is added to the selected tally. A zero-balance vote is
-rejected with `ForgeError::InvalidInput`. Finalisation still requires a
-strict weighted majority. After the deadline, the first `execute` call finalises the vote; a
+rejected with `ForgeError::InvalidInput`. Finalization still requires a
+strict weighted majority. After the deadline, the first `execute` call finalizes the vote; a
 succeeded proposal is then dispatched by a subsequent permissionless
 `execute` call. Only a successful target invocation changes `Succeeded` to
 `Executed`. A target revert returns
@@ -51,8 +51,8 @@ Proposals progress through the following states, driven entirely by
 | State | Meaning | Entered from | Exits to |
 |---|---|---|---|
 | `Active` | Voting in progress | `propose` | `Succeeded`, `Defeated`, `Cancelled` |
-| `Succeeded` | Strict `for` majority after the deadline; ready for dispatch | `execute` (finalisation) | `Executed` |
-| `Defeated` | No strict majority after the deadline (including ties and zero votes) | `execute` (finalisation) | — (terminal) |
+| `Succeeded` | Strict `for` majority after the deadline; ready for dispatch | `execute` (finalization) | `Executed` |
+| `Defeated` | No strict majority after the deadline (including ties and zero votes) | `execute` (finalization) | — (terminal) |
 | `Executed` | Target dispatch succeeded | `execute` (dispatch) | — (terminal) |
 | `Cancelled` | Withdrawn by the original proposer | `cancel_proposal` | — (terminal) |
 | `Queued` | Reserved for an optional timelock; **not reachable** through the public interface | — | — |
@@ -73,7 +73,7 @@ Transition rules enforced by the contract:
   voter regardless of balance. Voting before `initialize` returns
   `ForgeError::NotInitialized`.
 - `execute` before the deadline is `ForgeError::InvalidInput`.
-- On `Active` past deadline, `execute` finalises: `for_votes > against_votes`
+- On `Active` past deadline, `execute` finalizes: `for_votes > against_votes`
   → `Succeeded` (bond stays in custody); otherwise → `Defeated` (bond
   forfeited to the treasury). Ties and zero-vote proposals are `Defeated`.
 - A `Succeeded` proposal is dispatched by a **second, separate** `execute`
@@ -150,7 +150,7 @@ implicit in Soroban.
 Delivering an approved action is a two-step process, both steps
 permissionless and keyed by `execute(proposal_id)`:
 
-1. **Finalisation** (proposal `Active` past the deadline): the tally is
+1. **Finalization** (proposal `Active` past the deadline): the tally is
    frozen. A strict `for` majority moves the proposal to `Succeeded` — the
    bond remains in custody and **no target call is made yet**. Otherwise the
    proposal becomes `Defeated` and the bond is forfeited.
@@ -214,7 +214,7 @@ A full lifecycle, from deployment to on-chain effect:
    and rejects zero-balance voters, duplicate votes, votes after the deadline,
    and votes on non-`Active` proposals.
 
-4. **Finalise.** After `voting_ends`, anyone (not just voters — the
+4. **Finalize.** After `voting_ends`, anyone (not just voters — the
    proposal creator or an observer) calls `execute(&proposal_id)`. A strict
    `for` majority moves the proposal to `Succeeded` (`Finalised` event);
    otherwise it becomes `Defeated` and the bond is forfeited to the
