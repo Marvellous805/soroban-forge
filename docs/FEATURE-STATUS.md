@@ -28,7 +28,7 @@ treasury at a terminal transition.
 ## Escrow (`crates/escrow`) — **flagship**
 
 | Entrypoint | Status | Notes |
-|---|---|---|
+| :--- | :---: | :--- |
 | `create_escrow` | ✅ Implemented | Validates amount/timeout, buyer+seller auth, takes the SEP-41 token address |
 | `deposit` | ✅ Implemented | **Real token transfer** buyer → contract, before any state write |
 | `release` | ✅ Implemented | Seller-authorized; **real token transfer** contract → seller (full remaining balance) |
