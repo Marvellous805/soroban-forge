@@ -10,9 +10,23 @@ use super::*;
 /// 5. Verify token flow and subscription state
 #[test]
 fn vesting_feeds_subscription() {
-    let (_env, _accounts) = setup_env();
+    let (env, accounts) = setup_env();
 
-    // TODO: Implement vesting to subscription composition test
-    // This requires understanding the current vesting and subscription APIs
-    // For now, this is a placeholder to establish the test structure
+    let harness = CrossContractHarness::new(env.clone());
+    harness.setup_vesting_subscription();
+
+    // Beneficiary claims vested tokens.
+    let beneficiary = accounts.beneficiary.clone();
+    let claimed = harness.vesting.claim(&beneficiary);
+    assert!(claimed > 0, "vesting claim must yield tokens");
+
+    // Beneficiary pays for a subscription using claimed tokens.
+    let subscription_id = harness.subscription.subscribe(&beneficiary, &claimed);
+    assert!(
+        harness.subscription.is_active(&subscription_id),
+        "subscription must be active after payment"
+    );
+
+    // Conservation: total tokens across both contracts remain constant.
+    harness.assert_token_conservation();
 }

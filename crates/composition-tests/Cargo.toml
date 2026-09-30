@@ -1,17 +1,1 @@
-[package]
-name = "soroban-forge-composition-tests"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lib]
-name = "composition_tests"
-doctest = false
-
-# Only include minimal dependencies needed for basic testing
-[dependencies]
-soroban-sdk.workspace = true
-soroban-forge-shared-utils = { path = "../shared-utils" }
-soroban-forge-test-utils = { path = "../test-utils" }
+W3BhY2thZ2VdCm5hbWUgPSAic29yb2Jhbi1mb3JnZS1jb21wb3NpdGlvbi10ZXN0cyIKdmVyc2lvbi53b3Jrc3BhY2UgPSB0cnVlCmVkaXRpb24ud29ya3NwYWNlID0gdHJ1ZQpydXN0LXZlcnNpb24ud29ya3NwYWNlID0gdHJ1ZQpsaWNlbnNlLndvcmtzcGFjZSA9IHRydWUKcmVwb3NpdG9yeS53b3Jrc3BhY2UgPSB0cnVlCgpbZGV2LWRlcGVuZGVuY2llc10Kc29yb2Jhbi1zZGsu d29ya3NwYWNlID0gdHJ1ZQpzb3JvYmFuLWZvcmdlLXNoYXJlZC11dGlscyA9IHsgcGF0aCA9ICIuLi9zaGFyZWQtdXRpbHMiIH0Kc29yb2Jhbi1mb3JnZS10ZXN0LXV0aWxzID0geyBwYXRoID0gIi4uL3Rlc3QtdXRpbHMiIH0KcHJvcHRlc3QgPSAiMS4wIgo=

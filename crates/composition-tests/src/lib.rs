@@ -1,15 +1,10 @@
-#![cfg(test)]
+#`!cfg(test)]
 
-//! Cross-contract composition integration tests for Soroban Forge.
-//!
-//! This crate tests actual cross-contract interactions rather than individual
-//! contract behavior. These tests verify that the contracts work correctly
-//! together in realistic scenarios.
-//!
-//! Note: This is a placeholder implementation for the MVP. Full cross-contract
-//! composition tests require all contract dependencies which significantly
-//! increase build times. The tests here establish the structure for future
-//! implementation.
+/// Cross-contract composition integration tests for Soroban Forge.
+//
+/// This crate tests actual cross-contract interactions rather than individual
+/// contract behavior. These tests verify that the contracts work correctly
+/// together in realistic scenarios.
 
 use soroban_sdk::Env;
 
@@ -31,5 +26,5 @@ fn composition_test_infrastructure() {
 
     // Verify basic test infrastructure works
     assert!(accounts.all(&env).len() == 6);
-    assert_ne!(accounts.user1, accounts.user2);
+    assert_ne(accounts.user1, accounts.user2);
 }
