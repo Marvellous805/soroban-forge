@@ -57,18 +57,20 @@ fn create_schedule_succeeds_and_is_locked() {
 #[test]
 fn lifecycle_events_cover_creation_claim_and_silent_zero_claim() {
     let (env, token, _tc, _cid, client, accounts) = setup!();
-    let before_create = env.events().all().events().len();
+    // In soroban-sdk 27, `env.events().all()` returns the events published
+    // by the most recent contract invocation (not a cumulative log), so each
+    // step asserts the exact per-call emission instead of a delta.
     let id = create(&client, &token, &accounts);
-    assert_eq!(env.events().all().events().len(), before_create + 1);
+    assert_eq!(env.events().all().events().len(), 1);
 
-    let after_create = env.events().all().events().len();
+    // A claim before the cliff pays out zero and stays silent: it returns
+    // before the transfer and before the `Claimed` event.
     assert_eq!(client.claim(&id), 0);
-    assert_eq!(env.events().all().events().len(), after_create);
+    assert_eq!(env.events().all().events().len(), 0);
 
     env.ledger().set_timestamp(START + DURATION);
-    let before_claim = env.events().all().events().len();
     assert_eq!(client.claim(&id), TOTAL);
-    assert!(env.events().all().events().len() > before_claim);
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]

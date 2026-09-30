@@ -1272,7 +1272,7 @@ impl SubscriptionPayments {
             failed_attempts: 0,
             quotas,
         };
-        Self::store_subscription(&env, subscription_id, &subscription);
+        Self::store_subscription(env, subscription_id, &subscription);
         Self::append_index(
             env,
             &DataKey::SubscriberSubscriptions(subscriber),
