@@ -70,7 +70,9 @@ fn lifecycle_events_cover_creation_claim_and_silent_zero_claim() {
 
     env.ledger().set_timestamp(START + DURATION);
     assert_eq!(client.claim(&id), TOTAL);
-    assert_eq!(env.events().all().events().len(), 1);
+    // The mature claim invocation publishes two events: the nested SEP-41
+    // payout transfer from the contract, then the `Claimed` record.
+    assert_eq!(env.events().all().events().len(), 2);
 }
 
 #[test]
